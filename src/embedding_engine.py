@@ -81,6 +81,10 @@ class BaseEmbeddingEngine(abc.ABC):
     def vector_dim(self) -> int:
         """返回向量维度（用于 db meta 校验防止混用）。"""
 
+    @abc.abstractmethod
+    async def generate_async(self, text: str) -> list[float]:
+        """异步算一条向量（生产路径）。失败返回空列表（不抛运行期异常）。"""
+
     def warmup(self) -> None:
         """子类可选：提前把模型加载到内存，避免首次调用延迟。"""
         return None

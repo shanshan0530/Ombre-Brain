@@ -1559,7 +1559,7 @@ async def dream_hook(request):
             resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
             parts.append(
                 f"{meta.get('name', b['id'])} {resolved_tag} "
-                f"V{meta.get('valence', 0.5):.1f}/A{meta.get('arousal', 0.3):.1f}\n"
+                f"V{float(meta.get('valence') or 0.5):.1f}/A{float(meta.get('arousal') or 0.3):.1f}\n"
                 f"{strip_wikilinks(b['content'][:200])}"
             )
 

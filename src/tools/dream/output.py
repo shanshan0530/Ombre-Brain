@@ -39,8 +39,8 @@ def format_dream_output(
         meta = b["metadata"]
         resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
         domains = ",".join(meta.get("domain", []))
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
+        val = float(meta.get("valence") or 0.5)
+        aro = float(meta.get("arousal") or 0.3)
         created = meta.get("created", "")
         last_active = meta.get("last_active", "")
         parts.append(
@@ -101,7 +101,7 @@ def format_dream_output(
             used = 0
             for f in feels_all:
                 fmeta = f["metadata"]
-                fv = fmeta.get("valence", 0.5)
+                fv = float(fmeta.get("valence") or 0.5)
                 fcreated = fmeta.get("created", "")[:10]
                 fcontent_full = strip_wikilinks(f["content"]).strip()
                 line_full = f"[{f['id']}] V{fv:.1f} {fcreated} {fcontent_full}"

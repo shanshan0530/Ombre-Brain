@@ -110,7 +110,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
             ).timestamp()
         except (ValueError, TypeError):
             last_ts = 0.0
-        av = float(meta.get("arousal", 0.3)) * float(meta.get("valence", 0.5))
+        av = float(meta.get("arousal") or 0.3) * float(meta.get("valence") or 0.5)
         imp = int(meta.get("importance", 5))
         return (score, last_ts, av, imp)
 

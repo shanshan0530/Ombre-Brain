@@ -92,7 +92,7 @@ async def surface_search(
             clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
             if q_valence is not None and "valence" in clean_meta:
-                original_v = float(clean_meta.get("valence", 0.5))
+                original_v = float(clean_meta.get("valence") or 0.5)
                 shift = (q_valence - 0.5) * 0.2
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
             summary = await rt.dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)

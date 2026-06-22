@@ -130,8 +130,8 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
         except Exception:
             score = 0.0
         domains = ",".join(meta.get("domain", []))
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
+        val = float(meta.get("valence") or 0.5)
+        aro = float(meta.get("arousal") or 0.3)
         resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
         name = meta.get("name", "") or ""
         name_tag = f" 《{name}》" if name and name != b["id"] else ""

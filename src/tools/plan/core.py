@@ -185,7 +185,7 @@ async def letter_read(
     for b in letters:
         m = b["metadata"]
         a = m.get("author", "?")
-        d = m.get("letter_date") or m.get("created", "")[:10]
+        d = (m.get("letter_date") or m.get("created", ""))[:10]
         title = m.get("title") or m.get("name", "")
         parts.append(
             f"[{b['id']}] {a} · {d}{(' · ' + title) if title else ''}\n"
