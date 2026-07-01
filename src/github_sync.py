@@ -94,6 +94,13 @@ class GitHubSync:
             async with httpx.AsyncClient(headers=self._headers, timeout=_TIMEOUT) as c:
                 # 取 branch HEAD → commit tree → 递归列出全部 blob
                 r = await self._request(c, "GET", f"{_API}/repos/{self.repo}/git/ref/heads/{self.branch}")
+                if _is_empty_repo_response(r):
+                    return {
+                        "ok": True,
+                        "imported": 0,
+                        "skipped": 0,
+                        "message": f"GitHub 仓库 {self.repo} 还是空仓库，暂无可导入的记忆文件",
+                    }
                 if r.status_code == 404:
                     return {"ok": False, "error": f"分支 {self.branch} 不存在"}
                 r.raise_for_status()
@@ -244,17 +251,21 @@ class GitHubSync:
         最后只打一个 commit。所有请求都带指数退避重试以应对偶发的二级限流。
         """
         async with httpx.AsyncClient(headers=self._headers, timeout=_TIMEOUT) as c:
-            # 1. 获取 branch HEAD commit SHA
+            # 1. 获取 branch HEAD commit SHA。GitHub 空仓库没有任何 ref，会在这里返回 409。
             r = await self._request(c, "GET", f"{_API}/repos/{self.repo}/git/ref/heads/{self.branch}")
+            bootstrap_branch = _is_empty_repo_response(r)
+            head_sha: str | None = None
+            base_tree_sha: str | None = None
             if r.status_code == 404:
                 raise RuntimeError(f"分支 {self.branch} 不存在，请先在 GitHub 上创建该分支")
-            r.raise_for_status()
-            head_sha: str = r.json()["object"]["sha"]
+            if not bootstrap_branch:
+                r.raise_for_status()
+                head_sha = r.json()["object"]["sha"]
 
-            # 2. 获取 HEAD commit 对应的 tree SHA
-            r = await self._request(c, "GET", f"{_API}/repos/{self.repo}/git/commits/{head_sha}")
-            r.raise_for_status()
-            base_tree_sha: str = r.json()["tree"]["sha"]
+                # 2. 获取 HEAD commit 对应的 tree SHA
+                r = await self._request(c, "GET", f"{_API}/repos/{self.repo}/git/commits/{head_sha}")
+                r.raise_for_status()
+                base_tree_sha = r.json()["tree"]["sha"]
 
             # 3. 组装 tree entries（内联 content，文本直接走 UTF-8）
             entries: list[dict] = []
@@ -277,9 +288,12 @@ class GitHubSync:
             cur_base = base_tree_sha
             for i in range(0, len(entries), _TREE_CHUNK):
                 chunk = entries[i:i + _TREE_CHUNK]
+                tree_payload: dict[str, Any] = {"tree": chunk}
+                if cur_base:
+                    tree_payload["base_tree"] = cur_base
                 r = await self._request(
                     c, "POST", f"{_API}/repos/{self.repo}/git/trees",
-                    json={"base_tree": cur_base, "tree": chunk},
+                    json=tree_payload,
                 )
                 r.raise_for_status()
                 cur_base = r.json()["sha"]
@@ -292,17 +306,23 @@ class GitHubSync:
                 json={
                     "message": f"Ombre Brain sync — {now_str} ({len(files)} files)",
                     "tree": new_tree_sha,
-                    "parents": [head_sha],
+                    "parents": [head_sha] if head_sha else [],
                 },
             )
             r.raise_for_status()
             commit_sha: str = r.json()["sha"]
 
-            # 6. 更新 branch ref
-            r = await self._request(
-                c, "PATCH", f"{_API}/repos/{self.repo}/git/refs/heads/{self.branch}",
-                json={"sha": commit_sha, "force": False},
-            )
+            # 6. 更新已有 branch ref；空仓库首次提交则创建 branch ref
+            if bootstrap_branch:
+                r = await self._request(
+                    c, "POST", f"{_API}/repos/{self.repo}/git/refs",
+                    json={"ref": f"refs/heads/{self.branch}", "sha": commit_sha},
+                )
+            else:
+                r = await self._request(
+                    c, "PATCH", f"{_API}/repos/{self.repo}/git/refs/heads/{self.branch}",
+                    json={"sha": commit_sha, "force": False},
+                )
             r.raise_for_status()
 
         return len(files)
@@ -346,3 +366,14 @@ class GitHubSync:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _is_empty_repo_response(resp: httpx.Response) -> bool:
+    """GitHub returns 409 when refs are requested from a zero-commit repo."""
+    if resp.status_code != 409:
+        return False
+    try:
+        message = str(resp.json().get("message", ""))
+    except Exception:
+        message = resp.text
+    return "empty" in message.lower()

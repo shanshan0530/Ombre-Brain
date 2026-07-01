@@ -2,6 +2,21 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.4.7
+
+### 修复 / Fixed
+
+- 修复 GitHub 新建空仓库（Zero Commit，首页仍是 Quick setup）首次同步时报 `409 Conflict` 的问题。现在 Ombre 会在空仓库中创建初始 tree/commit，并创建 `refs/heads/<branch>`，无需用户先手动添加 README。
+- 从空 GitHub 仓库导入时返回“暂无可导入文件”，不再把空仓库 409 当作异常。
+
+### 测试 / Tests
+
+- 新增 `tests/test_github_sync_zero_commit.py` 覆盖 zero-commit 仓库首次存档 bootstrap 流程。
+
+### 维护 / Chores
+
+- VERSION + `src/VERSION` -> 2.4.7。
+
 ## 2.4.6
 
 ### 优化 / Improved
