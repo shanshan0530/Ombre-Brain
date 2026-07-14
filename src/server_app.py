@@ -146,7 +146,7 @@ class MCPAuthMiddleware:
             valid = auth.startswith("Bearer ") and self.token_validator(
                 auth[7:], resource=resource
             )
-            if not valid and self.auth_mode == "token":
+            if not valid:
                 # Fallback header for MCP clients that can't customize Authorization.
                 alt_token = headers.get(b"ombre-mcp-token", b"").decode(
                     "latin-1"
