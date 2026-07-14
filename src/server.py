@@ -904,7 +904,7 @@ if __name__ == "__main__":
             # Explicit IPv4 avoids localhost resolving to ::1 in Proot/Termux.
             keepalive_url=f"http://127.0.0.1:{OMBRE_PORT}/health",
         )
-         def _is_valid_oauth_or_static_mcp_token(
+        def _is_valid_oauth_or_static_mcp_token(
             token: str,
             resource: str = "",
           ) -> bool:
