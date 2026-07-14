@@ -904,21 +904,21 @@ if __name__ == "__main__":
             # Explicit IPv4 avoids localhost resolving to ::1 in Proot/Termux.
             keepalive_url=f"http://127.0.0.1:{OMBRE_PORT}/health",
         )
-       def _is_valid_oauth_or_static_mcp_token(
-    token: str,
-    resource: str = "",
-) -> bool:
-    return (
-        _is_valid_mcp_token(token, resource)
-        or _is_valid_static_mcp_token(token, resource)
-    )
+         def _is_valid_oauth_or_static_mcp_token(
+            token: str,
+            resource: str = "",
+          ) -> bool:
+            return (
+              _is_valid_mcp_token(token, resource)
+              or _is_valid_static_mcp_token(token, resource)
+            )
 
 
-_mcp_token_validator = (
-    _is_valid_static_mcp_token
-    if _http_settings.auth_mode == "token"
-    else _is_valid_oauth_or_static_mcp_token
-)
+        _mcp_token_validator = (
+            _is_valid_static_mcp_token
+            if _http_settings.auth_mode == "token"
+            else _is_valid_oauth_or_static_mcp_token
+        )
         _app = build_http_app(
             mcp,
             transport,
