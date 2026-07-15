@@ -186,7 +186,9 @@ def effective_configuration_report(
             "transport": effective_transport,
             "mcp_require_auth": effective_auth,
             "buckets_dir": str(runtime_config.get("buckets_dir") or ""),
-            "bind_host": str(env.get("OMBRE_BIND_HOST", "") or "0.0.0.0"),
+            # Report-only: reflects server.py's own OMBRE_BIND_HOST default for
+            # display in the diagnostics report; this module never opens a socket.
+            "bind_host": str(env.get("OMBRE_BIND_HOST", "") or "0.0.0.0"),  # nosec B104
         },
         "overrides": overrides,
         "environment_sources": environment_sources,

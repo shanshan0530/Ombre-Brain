@@ -32,8 +32,10 @@ import asyncio
 import logging
 import math
 import shutil
+import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 
 # 统一错误体系：越界 clamp 时上报 OB-W001/OB-W002（rule.md §11）
@@ -45,6 +47,53 @@ except Exception:
     except Exception:
         def _ob_push_warning(*_a, **_kw):  # type: ignore
             return None
+
+
+@asynccontextmanager
+async def _filesystem_turn(base_dir: str, key: str, timeout_seconds: float = 30.0):
+    """Cross-thread/cross-loop mutual exclusion via atomic lock-file creation.
+
+    A plain ``asyncio.Lock`` only serializes tasks scheduled on the same event
+    loop; FastMCP may dispatch requests from different loops/threads (see the
+    identical rationale in tools/_common.py's ``_filesystem_content_turn``), so
+    quota check-then-write sequences (anchor's 24-cap) need an OS-level guard
+    instead of an in-process one.
+    """
+    if not base_dir:
+        yield
+        return
+    lock_dir = Path(base_dir) / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{key}.lock"
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    stale_seconds = 60.0
+    deadline = time.monotonic() + timeout_seconds
+    acquired = False
+    while not acquired:
+        try:
+            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > stale_seconds:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {key} lock")
+            await asyncio.sleep(0.01)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+            acquired = True
+    try:
+        yield
+    finally:
+        try:
+            if lock_path.read_text(encoding="utf-8") == token:
+                lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _clamp_importance(v, source: str) -> int:
@@ -92,6 +141,7 @@ from utils import (
     parse_bool,
     parse_iso_datetime,
 )
+from media_store import MediaStore
 from bucket_scoring import (
     calc_topic_score,
     calc_emotion_score,
@@ -219,6 +269,11 @@ class BucketManager:
         self.v3_runtime = v3_runtime
         # --- Read storage paths from config / 从配置中读取存储路径 ---
         self.base_dir = config["buckets_dir"]
+        self.media_store = MediaStore(
+            self.base_dir,
+            str(config.get("media_dir") or os.path.join(self.base_dir, "_media")),
+            max_bytes=int(config.get("media_max_bytes") or 25 * 1024 * 1024),
+        )
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
@@ -280,6 +335,13 @@ class BucketManager:
         self._active_cache: "list[dict] | None" = None
         self._active_file_state: dict[str, tuple[int, int]] = {}
         self._active_cache_lock = asyncio.Lock()
+        # 见 _bucket_turn：archive()/update()/delete()/touch() 各自独立做
+        # find_file → load → mutate → atomic_write，互不知会。并发命中同一个
+        # bucket_id 时（比如衰减引擎后台 archive() 撞上一次 trace/hold 的
+        # update()），后到的那个基于自己读到的旧 file_path 写回，可能在另一个
+        # 已经把文件 move 进 archive/ 之后，在原路径「复活」一份带旧内容的
+        # 桶。找茬会话（2026-07-15）发现，按 tools/_common.py 里 _quota_turn
+        # 同一套跨 loop/进程文件锁方案修，见 _bucket_turn()。
         storage_cfg = config.get("storage", {}) or {}
         try:
             self.external_change_poll_seconds = max(
@@ -509,10 +571,7 @@ class BucketManager:
 
     @classmethod
     def _normalize_media(cls, media) -> list[dict]:
-        """校验/裁剪 media 引用列表。path 是唯一必填项，其余字段可选透传。
-
-        系统不解析、不存储、不迁移文件本身，只保存不透明的引用字符串。
-        """
+        """校验持久媒体元数据；path 必须已经由 MediaStore 稳定化。"""
         if not media:
             return []
         if not isinstance(media, list):
@@ -534,6 +593,17 @@ class BucketManager:
             note = item.get("note")
             if note:
                 entry["note"] = cls._sanitize_text(str(note)).strip()[:_MEDIA_NOTE_MAX]
+            digest = str(item.get("sha256") or "").lower()
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                entry["sha256"] = digest
+            try:
+                size = int(item.get("size"))
+            except (TypeError, ValueError, OverflowError):
+                size = -1
+            if size >= 0:
+                entry["size"] = size
+            if item.get("stored") is True:
+                entry["stored"] = True
             normalized.append(entry)
             if len(normalized) >= _MEDIA_MAX_ITEMS:
                 break
@@ -824,7 +894,7 @@ class BucketManager:
         bucket_id_override: str = "",
         allow_embedding_fallback: bool = False,
         meaning: str = "",
-        media: Optional[list[dict]] = None,
+        media: Any = None,
         test_data: bool = False,
     ) -> str:
         """
@@ -954,7 +1024,8 @@ class BucketManager:
         meaning_item = self._normalize_meaning_item(meaning)
         if meaning_item:
             metadata["meaning"] = [meaning_item]
-        normalized_media = self._normalize_media(media)
+        persisted_media = await self.media_store.persist(bucket_id, media)
+        normalized_media = self._normalize_media(persisted_media)
         if normalized_media:
             metadata["media"] = normalized_media
         # --- iter 1.8: plan 的「承诺重量」0.0-1.0，与 importance 不同 ---
@@ -1133,6 +1204,16 @@ class BucketManager:
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
         return str(new_path)
 
+    def _bucket_turn(self, bucket_id: str):
+        """Serialize archive()/update()/delete()/touch() on the same bucket_id.
+
+        Uses the same cross-loop/cross-process lock-file mechanism as
+        ``tools/_common.py``'s ``_quota_turn`` rather than an ``asyncio.Lock``
+        — FastMCP may dispatch requests from different event loops/threads,
+        so an in-process lock would not actually serialize them.
+        """
+        return _filesystem_turn(str(self.base_dir), f"bucket-{bucket_id}")
+
     # ---------------------------------------------------------
     # Update bucket
     # 更新桶
@@ -1155,6 +1236,22 @@ class BucketManager:
         bump_active=True：把这次写入视作一次真实激活（如 hold/grow 合并近邻桶），
         同步刷新 last_active 并累加 activation_count，语义与 touch() 一致。
         """
+        async with self._bucket_turn(bucket_id):
+            return await self._update_locked(
+                bucket_id,
+                allow_embedding_fallback=allow_embedding_fallback,
+                bump_active=bump_active,
+                **kwargs,
+            )
+
+    async def _update_locked(
+        self,
+        bucket_id: str,
+        *,
+        allow_embedding_fallback: bool = False,
+        bump_active: bool = False,
+        **kwargs,
+    ) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1190,10 +1287,14 @@ class BucketManager:
             ) or [_DEFAULT_DOMAIN_NAME]
         if "media" in kwargs:
             # Miss: media 是整体覆盖写入（trace 的 media_replace）。传空列表即清空该字段。
-            kwargs["media"] = self._normalize_media(kwargs["media"])
+            kwargs["media"] = self._normalize_media(
+                await self.media_store.persist(bucket_id, kwargs["media"])
+            )
         if "media_append" in kwargs:
             # Miss: media_append 是追加写入（trace 的 media_append / hold 每次调用）。
-            kwargs["media_append"] = self._normalize_media(kwargs["media_append"])
+            kwargs["media_append"] = self._normalize_media(
+                await self.media_store.persist(bucket_id, kwargs["media_append"])
+            )
         if "meaning" in kwargs:
             # Miss: meaning 整体覆盖写入（trace 的 meaning_replace，用于纠错/清理）。
             kwargs["meaning"] = self._normalize_meaning_list(kwargs["meaning"])
@@ -1468,6 +1569,10 @@ class BucketManager:
         F-10: 记忆不消失，只是淡去。不做物理删除，将文件移入 archive/
         并在 frontmatter 中写入 deleted_at 时间戳；embedding 仍清理以节省空间。
         """
+        async with self._bucket_turn(bucket_id):
+            return await self._delete_locked(bucket_id)
+
+    async def _delete_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1540,6 +1645,10 @@ class BucketManager:
 
         ripple=False 可跳过读全库的时间涟漪（性能 P2：批量浮现时不值当为它多跑 list_all）。
         """
+        async with self._bucket_turn(bucket_id):
+            await self._touch_locked(bucket_id, ripple=ripple)
+
+    async def _touch_locked(self, bucket_id: str, ripple: bool = True) -> None:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return
@@ -1888,6 +1997,13 @@ class BucketManager:
 
         Returns: {"ok": bool, "anchor": bool, "count": int, "limit": int, "error": Optional[str]}
         """
+        # anchor 上限 24 是「先数后写」的两步操作；没有这把锁，两个并发
+        # set_anchor(True) 都能在对方提交前读到同一个 count<limit，一起通过
+        # 检查后各自 update()，把总数冲破硬上限。
+        async with _filesystem_turn(str(self.base_dir), "quota-anchor"):
+            return await self._set_anchor_locked(bucket_id, value)
+
+    async def _set_anchor_locked(self, bucket_id: str, value: bool) -> dict:
         bucket = await self.get(bucket_id)
         if not bucket:
             return {"ok": False, "error": "bucket not found", "count": 0, "limit": self.ANCHOR_LIMIT}
@@ -2083,6 +2199,10 @@ class BucketManager:
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
         """
+        async with self._bucket_turn(bucket_id):
+            return await self._archive_locked(bucket_id)
+
+    async def _archive_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False

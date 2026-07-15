@@ -32,9 +32,10 @@ import yaml
 import logging
 import math
 import tempfile
+import threading
 from pathlib import Path
 from datetime import date, datetime
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ============================================================
@@ -102,6 +103,51 @@ def config_file_path() -> str:
     if os.path.exists(cwd_cfg):
         return cwd_cfg
     return os.path.join(_project_root(), "config.yaml")
+
+
+# 所有往 config.yaml 写东西的 Dashboard 接口（github/tunnel/config_api/buckets……）
+# 共用这一把锁 + 同一套原子写：谁都不能绕开它自己再开 open(path, "w") 整份覆盖。
+# 背景：github 备份配置曾经用「open(w) 直接整份覆盖、写失败只记 warning 但仍回 200」
+# 这种不安全写法，写失败时用户会看到「保存成功」、下次重启却发现配置又清空了。
+_config_yaml_lock = threading.RLock()
+
+
+def atomic_update_config_yaml(mutate: Callable[[dict], None]) -> dict:
+    """线程安全地读改写 config.yaml：加锁读现有内容，交给 ``mutate`` 原地 patch，
+    临时文件 + os.replace 原子落盘，写后回读校验内容确实落地了。
+
+    任何一步失败都直接抛异常——调用方必须把异常转成对用户如实的错误响应，
+    不能吞掉后仍然回「保存成功」，那样用户会以为配置在，其实只在内存里，
+    下次进程重启（崩溃/热更新/手动重启按钮）就会被磁盘上没写成功的旧内容盖掉。
+
+    返回值是写入后的完整 config dict（等价于重新读盘一次）。"""
+    config_path = config_file_path()
+    tmp = f"{config_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with _config_yaml_lock:
+        save_config: dict = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                save_config = yaml.safe_load(f) or {}
+        if not isinstance(save_config, dict):
+            save_config = {}
+        mutate(save_config)
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                yaml.dump(save_config, f, allow_unicode=True, default_flow_style=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, config_path)
+            with open(config_path, "r", encoding="utf-8") as f:
+                persisted = yaml.safe_load(f) or {}
+            if persisted != save_config:
+                raise OSError("config.yaml verification failed after write")
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+        return save_config
 
 
 def parse_bool(value, *, default=...) -> bool:
@@ -243,6 +289,28 @@ def load_config(config_path: Optional[str] = None) -> dict:
     #   "若环境变量非空 → 写到 config 的某个嵌套 key 上"
     # 现在统一走 _apply_env_override()，新增一项只要加一行表项。
 
+    # v1.x 兼容：旧变量不得因重构而静默失效。新变量显式设置时始终优先。
+    legacy_api_key = os.environ.get("OMBRE_API_KEY", "").strip()
+    legacy_base_url = os.environ.get("OMBRE_BASE_URL", "").strip()
+    if legacy_api_key and not os.environ.get("OMBRE_COMPRESS_API_KEY", "").strip():
+        config.setdefault("dehydration", {})["api_key"] = legacy_api_key
+        logging.warning(
+            "OMBRE_API_KEY 是兼容变量；请迁移到 OMBRE_COMPRESS_API_KEY，旧名仍会继续生效。"
+        )
+    if legacy_base_url and not os.environ.get("OMBRE_COMPRESS_BASE_URL", "").strip():
+        config.setdefault("dehydration", {})["base_url"] = legacy_base_url
+        logging.warning(
+            "OMBRE_BASE_URL 是兼容变量；请迁移到 OMBRE_COMPRESS_BASE_URL，旧名仍会继续生效。"
+        )
+
+    # v1.3 Zeabur 模板曾使用通用 PASSWORD；只在正式变量缺失时兼容映射。
+    legacy_password = os.environ.get("PASSWORD", "").strip()
+    if legacy_password and not os.environ.get("OMBRE_DASHBOARD_PASSWORD", "").strip():
+        os.environ["OMBRE_DASHBOARD_PASSWORD"] = legacy_password
+        logging.warning(
+            "PASSWORD 是兼容变量；请迁移到 OMBRE_DASHBOARD_PASSWORD，旧名仍会继续生效。"
+        )
+
     # 压缩组（脱水/打标/合并）—— 写到 config["dehydration"][*]
     _apply_env_override(config, "OMBRE_COMPRESS_API_KEY", "dehydration", "api_key")
     _apply_env_override(config, "OMBRE_COMPRESS_BASE_URL", "dehydration", "base_url")
@@ -346,11 +414,24 @@ def load_config(config_path: Optional[str] = None) -> dict:
         except Exception:
             pass
 
+    # 媒体必须和记忆一起落在持久卷；默认使用数据目录下独立的 _media。
+    # OMBRE_MEDIA_DIR 仅在确实挂载了另一块持久盘时覆盖。
+    media_dir = os.environ.get("OMBRE_MEDIA_DIR", "").strip()
+    config["media_dir"] = media_dir or os.path.join(str(config["buckets_dir"]), "_media")
+    try:
+        config["media_max_bytes"] = max(
+            1,
+            int(os.environ.get("OMBRE_MEDIA_MAX_BYTES", 25 * 1024 * 1024)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        config["media_max_bytes"] = 25 * 1024 * 1024
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
     buckets_dir: str = str(config["buckets_dir"])
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
+    os.makedirs(str(config["media_dir"]), exist_ok=True)
 
     return config
 

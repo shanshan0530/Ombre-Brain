@@ -12,7 +12,6 @@ import asyncio
 import os
 import httpx
 import json as _json_lib
-import yaml
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -32,19 +31,21 @@ def _persist_embedding_yaml(updates: dict) -> None:
 
     迁移完成后必须调用：否则切到本地/云端只改了进程内 sh.config，重启后 config.yaml
     还是旧的 → 与 embeddings.db 里已重算的向量维度不一致 → OB-W005 / 检索失效。
+    走 utils.atomic_update_config_yaml（加锁 + 原子写 + 读回校验），不再是
+    「open(w) 整份覆盖、失败只 logger.error」——半份写坏或和其它保存接口并发写
+    互相覆盖，都会让这里辛苦写的 dim/backend 悄悄丢回旧值，正是 OB-W005 反复复发的成因。
     """
     try:
-        from utils import config_file_path
-        _cfg_path = config_file_path()
-        _save: dict = {}
-        if os.path.exists(_cfg_path):
-            with open(_cfg_path, "r", encoding="utf-8") as _f:
-                _save = yaml.safe_load(_f) or {}
-        _sec = _save.setdefault("embedding", {})
-        for k, v in updates.items():
-            _sec[k] = v
-        with open(_cfg_path, "w", encoding="utf-8") as _f:
-            yaml.dump(_save, _f, allow_unicode=True, default_flow_style=False)
+        from utils import atomic_update_config_yaml
+
+        def _mutate(save_config: dict) -> None:
+            sec = save_config.setdefault("embedding", {})
+            if not isinstance(sec, dict):
+                sec = {}
+                save_config["embedding"] = sec
+            sec.update(updates)
+
+        atomic_update_config_yaml(_mutate)
     except Exception as e:
         logger.error(f"[migration] persist embedding to config.yaml failed: {e}")
 
@@ -316,11 +317,13 @@ def register(mcp) -> None:
             from migration_engine import (  # type: ignore
                 MigrationConfig, start_migration, is_running,
                 status_path_for as _mig_status_path_for,
+                staging_db_path_for, reset_stale_migration_state, target_signature,
             )
         except ImportError:
             from .migration_engine import (  # type: ignore
                 MigrationConfig, start_migration, is_running,
                 status_path_for as _mig_status_path_for,
+                staging_db_path_for, reset_stale_migration_state, target_signature,
             )
 
         if is_running():
@@ -343,10 +346,16 @@ def register(mcp) -> None:
         if body.get("model"):
             target_emb_cfg["model"] = str(body["model"]).strip()
 
+        # 迁移过程只写这个 staging db，绝不碰 live db，直到全部成功才原子替换
+        # （见 migration_engine.py 的 _run_migration）。
+        _live_db_path = getattr(sh.embedding_engine, "db_path", "") or os.path.join(
+            sh.config.get("buckets_dir", "buckets"), "embeddings.db"
+        )
         try:
             from embedding_engine import EmbeddingEngine  # type: ignore
         except ImportError:
             from ..embedding_engine import EmbeddingEngine  # type: ignore
+        target_emb_cfg["db_path"] = staging_db_path_for(_live_db_path)
         try:
             target_engine = EmbeddingEngine(target_cfg)
         except OBStartupError as oe:
@@ -361,6 +370,23 @@ def register(mcp) -> None:
             }, status_code=400)
 
         target_backend_obj = getattr(target_engine, "_backend", None)
+
+        # 目标签名（真正解析出来的 model/dim，不是请求里可能留空的原始参数）
+        # 跟上次不一致，说明 staging db 里如果有残留向量是另一个模型留下的，
+        # checkpoint 记的 done_ids 同样作废——必须先清掉再继续，否则断点续传
+        # 会把不兼容的旧向量当成「这个新目标已经完成」，直接原子替换进主库。
+        # _init_db() 是幂等的 CREATE TABLE IF NOT EXISTS，清空后必须重跑一次，
+        # 否则 target_engine 后续 sqlite3.connect() 会在空文件上直接建表失败。
+        if target_backend_obj is not None:
+            _signature = target_signature(
+                target_backend,
+                target_backend_obj.model_name(),
+                target_backend_obj.vector_dim(),
+            )
+            reset_stale_migration_state(
+                sh.config.get("buckets_dir", "buckets"), _live_db_path, _signature
+            )
+            target_engine._init_db()
 
         # 预检（fail-fast）：先用目标引擎试嵌入一小段，确认后端真的可用，
         # 再决定要不要启动全库重算。否则切到本地但 bge-m3 没下载 / ollama 没起，
