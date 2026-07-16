@@ -11,10 +11,13 @@
 import hashlib
 import json
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
 from import_memory import ImportEngine, ImportState, _EXTRACT_TOKEN_CEILING
+from tools import _runtime as rt
+from tools._common import count_high_importance
 from utils import count_tokens_approx
 
 
@@ -85,6 +88,97 @@ async def test_preserve_raw_reprocessing_same_chunk_does_not_duplicate(tmp_path)
 
     matches = [b for b in bucket_mgr.created if b["content"] == "我们的暗号是灯塔"]
     assert len(matches) == 1, f"preserve_raw 内容被重复建桶: {matches}"
+
+
+@pytest.mark.asyncio
+async def test_preserve_raw_import_respects_high_importance_quota(
+    bucket_mgr,
+    test_config,
+    monkeypatch,
+):
+    rt.config = test_config
+    rt.bucket_mgr = bucket_mgr
+    rt.logger = MagicMock()
+    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
+
+    await bucket_mgr.create(content="existing high", importance=9)
+    item = {
+        "name": "imported raw high",
+        "content": "raw imported high memory",
+        "domain": ["import"],
+        "valence": 0.5,
+        "arousal": 0.3,
+        "tags": [],
+        "importance": 9,
+        "preserve_raw": True,
+        "is_pattern": False,
+    }
+    engine = ImportEngine(
+        test_config,
+        bucket_mgr,
+        FakeDehydrator(extraction_items=[item]),
+    )
+
+    await engine._process_single_chunk(
+        {"content": "source transcript", "timestamp_start": ""},
+        preserve_raw=False,
+    )
+
+    imported = next(
+        bucket
+        for bucket in await bucket_mgr.list_all(include_archive=False)
+        if bucket["content"] == item["content"]
+    )
+    assert imported["metadata"]["importance"] == 8
+    assert await count_high_importance(bucket_mgr=bucket_mgr) == 1
+
+
+@pytest.mark.asyncio
+async def test_import_merge_promotion_respects_high_importance_quota(
+    bucket_mgr,
+    test_config,
+    monkeypatch,
+):
+    rt.config = test_config
+    rt.bucket_mgr = bucket_mgr
+    rt.logger = MagicMock()
+    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
+
+    await bucket_mgr.create(content="existing high", importance=9)
+    target_id = await bucket_mgr.create(
+        content="import merge target",
+        importance=5,
+        domain=["import"],
+    )
+
+    async def search_target(*_args, **_kwargs):
+        target = await bucket_mgr.get(target_id)
+        target["score"] = 100
+        return [target]
+
+    monkeypatch.setattr(bucket_mgr, "search", search_target)
+    engine = ImportEngine(
+        test_config,
+        bucket_mgr,
+        FakeDehydrator(),
+    )
+    merged = await engine._merge_or_create_item({
+        "name": "promoting import",
+        "content": "new imported event",
+        "domain": ["import"],
+        "valence": 0.5,
+        "arousal": 0.3,
+        "tags": [],
+        "importance": 9,
+    })
+
+    target = await bucket_mgr.get(target_id)
+    assert merged is True
+    assert target["metadata"]["importance"] == 8
+    assert "new imported event" in target["content"]
+    assert await count_high_importance(bucket_mgr=bucket_mgr) == 1
 
 
 # ------------------------------------------------------------

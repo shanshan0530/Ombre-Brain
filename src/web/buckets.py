@@ -38,17 +38,19 @@ except ImportError:  # pragma: no cover
 
 try:
     from tools._common import (  # type: ignore
-        _HIGH_IMP_THRESHOLD,
         _quota_turn,
         check_pinned_quota as _check_pinned_quota,
         enforce_high_importance_quota as _enforce_high_importance_quota,
+        is_terminal_memory_metadata as _is_terminal_memory_metadata,
+        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
     )
 except ImportError:  # pragma: no cover
     from ..tools._common import (  # type: ignore
-        _HIGH_IMP_THRESHOLD,
         _quota_turn,
         check_pinned_quota as _check_pinned_quota,
         enforce_high_importance_quota as _enforce_high_importance_quota,
+        is_terminal_memory_metadata as _is_terminal_memory_metadata,
+        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
     )
 
 
@@ -218,10 +220,93 @@ def register(mcp) -> None:
                 if not bucket:
                     return JSONResponse({"error": "not found"}, status_code=404)
                 meta = bucket.get("metadata", {})
+                if _is_terminal_memory_metadata(meta):
+                    return JSONResponse(
+                        {"error": "archived buckets cannot be pinned or unpinned"},
+                        status_code=409,
+                    )
                 current_pinned = parse_bool(meta.get("pinned"), default=False)
                 new_pinned = not current_pinned
                 protected = parse_bool(meta.get("protected"), default=False)
                 update_kwargs: dict[str, object] = {"pinned": new_pinned}
+                try:
+                    current_importance = int(meta.get("importance") or 0)
+                except (TypeError, ValueError):
+                    current_importance = 0
+                current_type = str(
+                    meta.get("type") or "dynamic"
+                ).strip().lower()
+                final_type = (
+                    "permanent"
+                    if new_pinned
+                    else "dynamic"
+                    if current_pinned and not protected
+                    else current_type
+                )
+                before_quota_meta = dict(meta)
+                before_quota_meta.update({
+                    "importance": current_importance,
+                    "pinned": current_pinned,
+                    "protected": protected,
+                    "type": current_type,
+                })
+                after_quota_meta = dict(before_quota_meta)
+                after_quota_meta.update({
+                    "importance": 10 if new_pinned else current_importance,
+                    "pinned": new_pinned,
+                    "type": final_type,
+                })
+                occupied_high_before = _occupies_high_importance_slot(
+                    before_quota_meta
+                )
+                occupies_high_after = _occupies_high_importance_slot(
+                    after_quota_meta
+                )
+                await quota_stack.enter_async_context(
+                    _quota_turn("high_importance")
+                )
+
+                locked_bucket = await sh.bucket_mgr.get(bucket_id)
+                if not locked_bucket:
+                    return JSONResponse({"error": "not found"}, status_code=404)
+                locked_meta = locked_bucket.get("metadata", {})
+                if not isinstance(locked_meta, dict):
+                    locked_meta = {}
+                if _is_terminal_memory_metadata(locked_meta):
+                    return JSONResponse(
+                        {"error": "bucket was archived concurrently"},
+                        status_code=409,
+                    )
+                initial_quota_state = (
+                    current_pinned,
+                    protected,
+                    current_importance,
+                    current_type,
+                    parse_bool(meta.get("dont_surface"), default=False),
+                )
+                try:
+                    locked_importance = int(
+                        locked_meta.get("importance") or 0
+                    )
+                except (TypeError, ValueError):
+                    locked_importance = 0
+                locked_quota_state = (
+                    parse_bool(locked_meta.get("pinned"), default=False),
+                    parse_bool(locked_meta.get("protected"), default=False),
+                    locked_importance,
+                    str(locked_meta.get("type") or "dynamic").strip().lower(),
+                    parse_bool(
+                        locked_meta.get("dont_surface"), default=False
+                    ),
+                )
+                if locked_quota_state != initial_quota_state:
+                    return JSONResponse(
+                        {
+                            "error": "bucket changed concurrently; reload and retry",
+                            "conflict": "concurrent_change",
+                        },
+                        status_code=409,
+                    )
 
                 if new_pinned:
                     quota_err = await _check_pinned_quota()
@@ -232,27 +317,23 @@ def register(mcp) -> None:
                     # ordinary high-importance bucket after unpinning.  Reserve
                     # that quota atomically too; when full, demote to 8 in the
                     # same BucketManager transaction.
-                    try:
-                        current_importance = int(meta.get("importance") or 0)
-                    except (TypeError, ValueError):
-                        current_importance = 0
-                    becomes_high_importance = (
-                        current_pinned
-                        and not protected
-                        and current_importance >= _HIGH_IMP_THRESHOLD
-                    )
-                    if becomes_high_importance:
-                        await quota_stack.enter_async_context(
-                            _quota_turn("high_importance")
+                    if occupies_high_after and not occupied_high_before:
+                        adjusted_importance = (
+                            await _enforce_high_importance_quota(current_importance)
                         )
-                        update_kwargs["importance"] = (
-                            await _enforce_high_importance_quota(
-                                current_importance
-                            )
-                        )
+                        if adjusted_importance != current_importance:
+                            update_kwargs["importance"] = adjusted_importance
 
                 ok = await sh.bucket_mgr.update(bucket_id, **update_kwargs)
                 if not ok:
+                    latest = await sh.bucket_mgr.get(bucket_id)
+                    if _is_terminal_memory_metadata(
+                        (latest or {}).get("metadata", {})
+                    ):
+                        return JSONResponse(
+                            {"error": "bucket was archived concurrently"},
+                            status_code=409,
+                        )
                     return JSONResponse({"error": "update failed"}, status_code=500)
 
                 persisted = await sh.bucket_mgr.get(bucket_id)
@@ -332,13 +413,48 @@ def register(mcp) -> None:
         if err:
             return err
         bucket_id = request.path_params["bucket_id"]
-        bucket = await sh.bucket_mgr.get(bucket_id)
-        if not bucket:
-            return JSONResponse({"error": "not found"}, status_code=404)
-        new_val = not bool(bucket["metadata"].get("dont_surface", False))
         try:
-            await sh.bucket_mgr.update(bucket_id, dont_surface=new_val)
-            return JSONResponse({"ok": True, "dont_surface": new_val})
+            async with _quota_turn("high_importance"):
+                bucket = await sh.bucket_mgr.get(bucket_id)
+                if not bucket:
+                    return JSONResponse({"error": "not found"}, status_code=404)
+                metadata = bucket.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                current = parse_bool(
+                    metadata.get("dont_surface"), default=False
+                )
+                new_val = not current
+                projected = dict(metadata)
+                projected["dont_surface"] = new_val
+                update_kwargs: dict[str, object] = {"dont_surface": new_val}
+                quota_adjustment = None
+                if (
+                    _occupies_high_importance_slot(projected)
+                    and not _occupies_high_importance_slot(metadata)
+                ):
+                    try:
+                        requested_importance = int(
+                            metadata.get("importance") or 0
+                        )
+                    except (TypeError, ValueError):
+                        requested_importance = 0
+                    applied_importance = await _enforce_high_importance_quota(
+                        requested_importance
+                    )
+                    if applied_importance != requested_importance:
+                        update_kwargs["importance"] = applied_importance
+                        quota_adjustment = {
+                            "requested": requested_importance,
+                            "applied": applied_importance,
+                        }
+                ok = await sh.bucket_mgr.update(bucket_id, **update_kwargs)
+                if not ok:
+                    return JSONResponse({"error": "update failed"}, status_code=500)
+                payload = {"ok": True, "dont_surface": new_val}
+                if quota_adjustment:
+                    payload["quota_adjustment"] = quota_adjustment
+                return JSONResponse(payload)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -370,25 +486,63 @@ def register(mcp) -> None:
             target = parse_bool(body["dont_surface"])
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        ok_ids, missing_ids, errors = [], [], []
-        for bid in ids:
-            try:
-                b = await sh.bucket_mgr.get(bid)
-                if not b:
-                    missing_ids.append(bid)
-                    continue
-                await sh.bucket_mgr.update(bid, dont_surface=target)
-                ok_ids.append(bid)
-            except Exception as e:
-                errors.append({"id": bid, "error": str(e)})
-                logger.warning(f"batch forget failed for {bid}: {e}")
-        return JSONResponse({
-            "ok": True,
+        ok_ids, missing_ids, errors, quota_adjustments = [], [], [], []
+        async with _quota_turn("high_importance"):
+            for bid in dict.fromkeys(ids):
+                try:
+                    b = await sh.bucket_mgr.get(bid)
+                    if not b:
+                        missing_ids.append(bid)
+                        continue
+                    metadata = b.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    projected = dict(metadata)
+                    projected["dont_surface"] = target
+                    update_kwargs: dict[str, object] = {"dont_surface": target}
+                    quota_adjustment = None
+                    if (
+                        _occupies_high_importance_slot(projected)
+                        and not _occupies_high_importance_slot(metadata)
+                    ):
+                        try:
+                            requested_importance = int(
+                                metadata.get("importance") or 0
+                            )
+                        except (TypeError, ValueError):
+                            requested_importance = 0
+                        applied_importance = (
+                            await _enforce_high_importance_quota(
+                                requested_importance
+                            )
+                        )
+                        if applied_importance != requested_importance:
+                            update_kwargs["importance"] = applied_importance
+                            quota_adjustment = {
+                                "id": bid,
+                                "requested": requested_importance,
+                                "applied": applied_importance,
+                            }
+                    ok = await sh.bucket_mgr.update(bid, **update_kwargs)
+                    if ok:
+                        ok_ids.append(bid)
+                        if quota_adjustment:
+                            quota_adjustments.append(quota_adjustment)
+                    else:
+                        errors.append({"id": bid, "error": "update failed"})
+                except Exception as e:
+                    errors.append({"id": bid, "error": str(e)})
+                    logger.warning(f"batch forget failed for {bid}: {e}")
+        payload = {
+            "ok": not errors,
             "dont_surface": target,
             "updated": ok_ids,
             "missing": missing_ids,
             "errors": errors,
-        })
+        }
+        if quota_adjustments:
+            payload["quota_adjustments"] = quota_adjustments
+        return JSONResponse(payload)
 
     @mcp.custom_route("/api/buckets/batch", methods=["POST"])
     async def api_buckets_batch(request: Request) -> Response:

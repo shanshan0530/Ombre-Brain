@@ -29,8 +29,9 @@ tools/_common.py — 跨工具共享的辅助逻辑
 
 from typing import Tuple
 import asyncio
-from concurrent.futures import Future
-from contextlib import asynccontextmanager
+from copy import deepcopy
+from concurrent.futures import Future, InvalidStateError
+from contextlib import AsyncExitStack, asynccontextmanager
 import hashlib
 import math
 import os
@@ -38,6 +39,8 @@ from pathlib import Path
 import threading
 import time
 import uuid
+
+from utils import parse_bool
 
 from . import _runtime as rt
 
@@ -66,6 +69,7 @@ _HIGH_IMP_THRESHOLD = 9                # importance 达到该值算“高重要�
 _HIGH_IMP_HARD_CAP = 24                # 高重要度桶硬上限
 _HIGH_IMP_SOFT_WARN = 22               # 达该数开始推 OB-W003 提醒
 _HIGH_IMP_DEGRADE_TO = 8               # 超限时自动降到的 importance
+_HIGH_IMP_EXEMPT_TYPES = frozenset({"feel", "plan", "letter", "archived"})
 
 # --- pinned 软阈值 ---
 _PINNED_SOFT_GAP = 2                   # “软阈值 = cap - GAP”；cap=20 → soft=18
@@ -97,11 +101,18 @@ _merge_content_tails_guard = threading.Lock()
 
 
 def _complete_content_turn(key: str, turn: Future[None]) -> None:
+    # Future callbacks may complete the next cancelled turn in the same
+    # thread.  Never call ``set_result`` while holding the non-reentrant tail
+    # guard, or that callback chain deadlocks trying to reacquire it.
     with _merge_content_tails_guard:
-        if not turn.done():
-            turn.set_result(None)
         if _merge_content_tails.get(key) is turn:
             _merge_content_tails.pop(key, None)
+    if not turn.done():
+        try:
+            turn.set_result(None)
+        except InvalidStateError:
+            # Another completion/cancellation won the race after ``done``.
+            pass
 
 
 @asynccontextmanager
@@ -174,13 +185,24 @@ async def _keyed_turn(key: str):
     acquired = previous is None
     try:
         if previous is not None:
-            await asyncio.wrap_future(previous)
+            # Do not let cancellation of this waiter cancel its predecessor's
+            # shared Future; later turns still depend on that predecessor as
+            # the serialization barrier.
+            await asyncio.shield(asyncio.wrap_future(previous))
             acquired = True
         async with _filesystem_content_turn(key):
             yield
     finally:
         if acquired:
             _complete_content_turn(key, turn)
+        elif previous is not None:
+            # A waiter can be cancelled before its predecessor finishes.  Its
+            # turn must still be completed once the predecessor releases;
+            # otherwise every later waiter for this key blocks forever on the
+            # abandoned Future.
+            previous.add_done_callback(
+                lambda _completed: _complete_content_turn(key, turn)
+            )
 
 
 @asynccontextmanager
@@ -361,12 +383,26 @@ async def count_pinned() -> int:
     """
     try:
         all_b = await rt.bucket_mgr.list_all(include_archive=False)
-        return sum(
-            1 for b in all_b
-            if b.get("metadata", {}).get("pinned")
-        )
+        seen_ids: set[str] = set()
+        count = 0
+        for bucket in all_b:
+            bucket_id = str(bucket.get("id") or "").strip()
+            if bucket_id:
+                if bucket_id in seen_ids:
+                    continue
+                seen_ids.add(bucket_id)
+            metadata = bucket.get("metadata", {})
+            if is_terminal_memory_metadata(metadata):
+                continue
+            if isinstance(metadata, dict) and parse_bool(
+                metadata.get("pinned"), default=False
+            ):
+                count += 1
+        return count
     except Exception as e:
-        rt.logger.warning(f"count_pinned failed: {e}")
+        warning = getattr(getattr(rt, "logger", None), "warning", None)
+        if callable(warning):
+            warning(f"count_pinned failed: {e}")
         return 0
 
 
@@ -389,11 +425,29 @@ async def repair_pinned_desync(bucket_mgr, apply: bool = False) -> dict:
 
     返回 dict：{total, pinned, orphans:[{id,name,importance}], applied, demoted, failed}。"""
     buckets = await bucket_mgr.list_all(include_archive=False)
-    pinned_now = [b for b in buckets if b.get("metadata", {}).get("pinned")]
-    orphans = [b for b in buckets if _is_pinned_orphan(b.get("metadata", {}))]
+    unique_buckets: list[dict] = []
+    seen_ids: set[str] = set()
+    for bucket in buckets:
+        bucket_id = str(bucket.get("id") or "").strip()
+        if bucket_id:
+            if bucket_id in seen_ids:
+                continue
+            seen_ids.add(bucket_id)
+        unique_buckets.append(bucket)
+    pinned_now = [
+        bucket
+        for bucket in unique_buckets
+        if isinstance(bucket.get("metadata"), dict)
+        and not is_terminal_memory_metadata(bucket["metadata"])
+        and parse_bool(bucket["metadata"].get("pinned"), default=False)
+    ]
+    orphans = [
+        b for b in unique_buckets
+        if _is_pinned_orphan(b.get("metadata", {}))
+    ]
 
     result: dict = {
-        "total": len(buckets),
+        "total": len(unique_buckets),
         "pinned": len(pinned_now),
         "orphans": [
             {
@@ -450,27 +504,93 @@ async def check_pinned_quota() -> str | None:
 # ============================================================
 
 
-async def count_high_importance() -> int:
-    """统计 importance≥9 的非 pinned/protected/letter 桶。失败时返回 0（不阻断写入）。
+def is_terminal_memory_metadata(metadata: dict | None) -> bool:
+    """Whether metadata represents an archived/deleted terminal memory."""
+    if not isinstance(metadata, dict):
+        return False
+    return bool(
+        metadata.get("deleted_at")
+        or parse_bool(metadata.get("tombstone"), default=False)
+        or str(metadata.get("type") or "").strip().lower() == "archived"
+    )
 
-    letter 固定 importance=10（原文永久保留，不衰减不合并），不是"动态记忆抢到了
-    高重要度名额"，排除逻辑与 cascade_plan_resolved_to_buckets 里跳过
-    plan/letter 是同一个理由：letter 不参与这套配额博弈。"""
+
+def is_importance_audit_candidate(
+    metadata: dict | None,
+    minimum: int,
+) -> bool:
+    """Shared visible ordinary-memory scope for importance audit and quota."""
+    if not isinstance(metadata, dict):
+        return False
     try:
-        all_b = await rt.bucket_mgr.list_all(include_archive=False)
-        return sum(
-            1 for b in all_b
-            if int(b.get("metadata", {}).get("importance") or 0) >= _HIGH_IMP_THRESHOLD
-            and not b.get("metadata", {}).get("pinned")
-            and not b.get("metadata", {}).get("protected")
-            and b.get("metadata", {}).get("type") != "letter"
-        )
+        importance = int(metadata.get("importance") or 0)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    if importance < minimum:
+        return False
+    if parse_bool(metadata.get("dont_surface"), default=False):
+        return False
+    if is_terminal_memory_metadata(metadata):
+        return False
+    bucket_type = str(metadata.get("type") or "dynamic").strip().lower()
+    return bucket_type not in _HIGH_IMP_EXEMPT_TYPES
+
+
+def occupies_high_importance_quota_slot(metadata: dict | None) -> bool:
+    """Whether one logical bucket occupies the ordinary importance>=9 pool.
+
+    This intentionally matches the auditable ``breath_advanced(importance_min=9)``
+    candidate scope, then additionally excludes pinned/protected buckets because
+    those have their own quota.  Explicit unpinned ``permanent`` buckets remain
+    ordinary candidates and therefore still count.
+    """
+    if not is_importance_audit_candidate(metadata, _HIGH_IMP_THRESHOLD):
+        return False
+    assert isinstance(metadata, dict)
+    if parse_bool(metadata.get("pinned"), default=False):
+        return False
+    if parse_bool(metadata.get("protected"), default=False):
+        return False
+    return True
+
+
+async def count_high_importance(bucket_mgr=None) -> int:
+    """Count unique logical buckets in the ordinary importance>=9 pool."""
+    manager = bucket_mgr if bucket_mgr is not None else rt.bucket_mgr
+    try:
+        all_b = await manager.list_all(include_archive=False)
+        seen_ids: set[str] = set()
+        duplicates = 0
+        count = 0
+        for bucket in all_b:
+            bucket_id = str(bucket.get("id") or "").strip()
+            if bucket_id:
+                if bucket_id in seen_ids:
+                    duplicates += 1
+                    continue
+                seen_ids.add(bucket_id)
+            if occupies_high_importance_quota_slot(bucket.get("metadata", {})):
+                count += 1
+        if duplicates:
+            warning = getattr(getattr(rt, "logger", None), "warning", None)
+            if callable(warning):
+                warning(
+                    "count_high_importance ignored %s duplicate physical bucket rows",
+                    duplicates,
+                )
+        return count
     except Exception as e:
-        rt.logger.warning(f"count_high_importance failed: {e}")
+        warning = getattr(getattr(rt, "logger", None), "warning", None)
+        if callable(warning):
+            warning(f"count_high_importance failed: {e}")
         return 0
 
 
-async def enforce_high_importance_quota(importance: int) -> int:
+async def enforce_high_importance_quota(
+    importance: int,
+    *,
+    bucket_mgr=None,
+) -> int:
     """importance≥9 配额检查 + 自动降级。
 
     - 当前数 ≥ 硬上限 → push OB-I001 并把 importance 降为 _HIGH_IMP_DEGRADE_TO
@@ -479,12 +599,18 @@ async def enforce_high_importance_quota(importance: int) -> int:
     """
     if importance < _HIGH_IMP_THRESHOLD:
         return importance
-    cur = await count_high_importance()
+    cur = (
+        await count_high_importance()
+        if bucket_mgr is None
+        else await count_high_importance(bucket_mgr=bucket_mgr)
+    )
     if cur >= _HIGH_IMP_HARD_CAP:
-        rt.logger.info(
-            f"op=quota phase=branch branch=imp_degrade requested={importance} "
-            f"current={cur} cap={_HIGH_IMP_HARD_CAP} degraded_to={_HIGH_IMP_DEGRADE_TO}"
-        )
+        info = getattr(getattr(rt, "logger", None), "info", None)
+        if callable(info):
+            info(
+                f"op=quota phase=branch branch=imp_degrade requested={importance} "
+                f"current={cur} cap={_HIGH_IMP_HARD_CAP} degraded_to={_HIGH_IMP_DEGRADE_TO}"
+            )
         _push_warning_safe(
             "OB-I001",
             f"当前已有 {cur} 条 importance≥{_HIGH_IMP_THRESHOLD}（硬上限 {_HIGH_IMP_HARD_CAP}），新桶 importance 自动降级为 {_HIGH_IMP_DEGRADE_TO}",
@@ -629,65 +755,165 @@ async def _merge_or_create_inner(
                 existing = [exact]
                 exact_storage_match = True
 
-    if not test_data and existing and existing[0].get("score", 0) > (rt.config.get("merge_threshold") or 75):
-        bucket = existing[0]
-        # --- 不合并到钉选/保护桶 ---
-        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-            try:
-                if raw_merge or exact_storage_match:
-                    # --- 原文拼接合并（hold 路径）---
-                    old_text = bucket["content"].rstrip()
-                    new_text = content.strip()
-                    if new_text and new_text not in old_text:
-                        merged = f"{old_text}\n\n---\n{new_text}" if old_text else new_text
+    merge_threshold = rt.config.get("merge_threshold") or 75
+    if (
+        not test_data
+        and existing
+        and existing[0].get("score", 0) > merge_threshold
+    ):
+        candidate_id = str(existing[0].get("id") or "").strip()
+        merge_key = hashlib.sha256(
+            candidate_id.encode("utf-8", errors="replace")
+        ).hexdigest()[:_CONTENT_LOCK_KEY_HEX]
+        try:
+            # Different new texts can resolve to the same target bucket.  The
+            # content-hash lock above cannot serialize that fan-in, so reserve
+            # the logical target too and optimistically retry regular edits.
+            async with _keyed_turn(f"merge-target-{merge_key}"):
+                for _attempt in range(3):
+                    bucket = await rt.bucket_mgr.get(candidate_id)
+                    if not bucket:
+                        break
+                    metadata = bucket.get("metadata", {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    if parse_bool(metadata.get("pinned"), default=False) or parse_bool(
+                        metadata.get("protected"), default=False
+                    ) or is_terminal_memory_metadata(metadata):
+                        break
+                    snapshot_content = str(bucket.get("content") or "")
+                    snapshot_metadata = deepcopy(metadata)
+
+                    if raw_merge or exact_storage_match:
+                        old_text = snapshot_content.rstrip()
+                        new_text = content.strip()
+                        if new_text and new_text not in old_text:
+                            merged = (
+                                f"{old_text}\n\n---\n{new_text}"
+                                if old_text
+                                else new_text
+                            )
+                        else:
+                            merged = old_text or new_text
                     else:
-                        merged = old_text or new_text
+                        merged = await rt.dehydrator.merge(
+                            snapshot_content, content
+                        )
+
+                    old_v = metadata.get("valence") or 0.5
+                    old_a = metadata.get("arousal") or 0.3
+                    merged_valence = (
+                        round((old_v + valence) / 2, 2)
+                        if 0 <= valence <= 1
+                        else old_v
+                    )
+                    merged_arousal = (
+                        round((old_a + arousal) / 2, 2)
+                        if 0 <= arousal <= 1
+                        else old_a
+                    )
+                    merged_importance = max(
+                        metadata.get("importance") or 5,
+                        importance,
+                    )
+                    update_kwargs = {
+                        "content": merged,
+                        "tags": list(set((metadata.get("tags") or []) + tags)),
+                        "importance": merged_importance,
+                        "domain": list(
+                            set((metadata.get("domain") or []) + domain)
+                        ),
+                        "valence": merged_valence,
+                        "arousal": merged_arousal,
+                    }
+                    if source_tool:
+                        update_kwargs["last_merged_by"] = source_tool
+                    if meaning:
+                        update_kwargs["meaning_append"] = meaning
+                    if media:
+                        update_kwargs["media_append"] = media
+
+                    async with AsyncExitStack() as commit_stack:
+                        if importance >= _HIGH_IMP_THRESHOLD:
+                            await commit_stack.enter_async_context(
+                                _quota_turn("high_importance")
+                            )
+                        bucket_turn = getattr(rt.bucket_mgr, "_bucket_turn", None)
+                        update_locked = getattr(
+                            rt.bucket_mgr, "_update_locked", None
+                        )
+                        use_locked_update = callable(bucket_turn) and callable(
+                            update_locked
+                        )
+                        if use_locked_update:
+                            await commit_stack.enter_async_context(
+                                bucket_turn(candidate_id)
+                            )
+
+                        locked_bucket = await rt.bucket_mgr.get(candidate_id)
+                        if not locked_bucket:
+                            break
+                        locked_metadata = locked_bucket.get("metadata", {})
+                        if not isinstance(locked_metadata, dict):
+                            locked_metadata = {}
+                        if is_terminal_memory_metadata(locked_metadata) or (
+                            str(locked_bucket.get("content") or "")
+                            != snapshot_content
+                            or locked_metadata != snapshot_metadata
+                        ):
+                            continue
+
+                        projected_metadata = dict(locked_metadata)
+                        projected_metadata["importance"] = merged_importance
+                        if (
+                            occupies_high_importance_quota_slot(
+                                projected_metadata
+                            )
+                            and not occupies_high_importance_quota_slot(
+                                locked_metadata
+                            )
+                        ):
+                            update_kwargs["importance"] = (
+                                await enforce_high_importance_quota(
+                                    merged_importance
+                                )
+                            )
+
+                        update_method = (
+                            update_locked
+                            if use_locked_update
+                            else rt.bucket_mgr.update
+                        )
+                        committed = await update_method(
+                            candidate_id,
+                            allow_embedding_fallback=(
+                                raw_merge and source_tool == "hold"
+                            ),
+                            bump_active=True,
+                            **update_kwargs,
+                        )
+                        if not committed:
+                            break
+
+                    try:
+                        rt.dehydrator.invalidate_cache(snapshot_content)
+                    except Exception:
+                        pass
+                    rt.logger.info(
+                        "op=merge_or_create phase=branch branch=merge "
+                        f"bucket_id={candidate_id} raw_merge={int(raw_merge)} "
+                        f"source_tool={source_tool or '_'} "
+                        f"score={existing[0].get('score', 0):.3f}"
+                    )
+                    return candidate_id, True, ""
                 else:
-                    # --- LLM 压缩合并（grow 路径）---
-                    merged = await rt.dehydrator.merge(bucket["content"], content)
-                old_v = bucket["metadata"].get("valence") or 0.5
-                old_a = bucket["metadata"].get("arousal") or 0.3
-                merged_valence = round((old_v + valence) / 2, 2) if 0 <= valence <= 1 else old_v
-                merged_arousal = round((old_a + arousal) / 2, 2) if 0 <= arousal <= 1 else old_a
-                update_kwargs = dict(
-                    content=merged,
-                    tags=list(set((bucket["metadata"].get("tags") or []) + tags)),
-                    importance=max(bucket["metadata"].get("importance") or 5, importance),
-                    domain=list(set((bucket["metadata"].get("domain") or []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
-                )
-                # iter 2.0：合并时记录「最后一次合并由谁触发」，不动原桶的 source_tool。
-                # 这样 dashboard 既能看到桶最初由谁创建，也能看到最近一次合并的来源。
-                if source_tool:
-                    update_kwargs["last_merged_by"] = source_tool
-                # Miss: 合并到老桶时，meaning 追加一条（不覆盖已有列表），media 追加引用。
-                if meaning:
-                    update_kwargs["meaning_append"] = meaning
-                if media:
-                    update_kwargs["media_append"] = media
-                await rt.bucket_mgr.update(
-                    bucket["id"],
-                    allow_embedding_fallback=(raw_merge and source_tool == "hold"),
-                    # 合并 = 写入了一件新的当下事件 → 视作一次真实激活，
-                    # 刷新 last_active 并累加 activation_count（否则合并后的记忆
-                    # 时间会停在旧桶创建时刻，反而更失真）。
-                    bump_active=True,
-                    **update_kwargs,
-                )
-                # --- 旧 content 的脱水缓存失效，让 breath 拿到合并后的新文本 ---
-                try:
-                    rt.dehydrator.invalidate_cache(bucket["content"])
-                except Exception:
-                    pass
-                rt.logger.info(
-                    f"op=merge_or_create phase=branch branch=merge bucket_id={bucket['id']} "
-                    f"raw_merge={int(raw_merge)} source_tool={source_tool or '_'} "
-                    f"score={existing[0].get('score', 0):.3f}"
-                )
-                return bucket["id"], True, ""
-            except Exception as e:
-                rt.logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
+                    rt.logger.warning(
+                        "Merge target changed repeatedly; creating a new bucket "
+                        "instead of overwriting concurrent edits: %s",
+                        candidate_id,
+                    )
+        except Exception as e:
+            rt.logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
     async def create_bucket(final_importance: int) -> str:
         return await rt.bucket_mgr.create(

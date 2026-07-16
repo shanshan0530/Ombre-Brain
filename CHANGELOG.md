@@ -2,6 +2,20 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.7.4
+
+### 修复 / Fixed
+
+- 修复取消钉选时 importance≥9 配额再次虚高的问题：计数现在与 `breath_advanced(importance_min=9)` 的可审计普通记忆范围一致，排除 pinned/protected、主动遗忘、feel/plan/letter、归档/删除终态，并按逻辑 bucket ID 去重；不再把 18 条普通高重要度误报为 89 条物理/特殊记录。
+- 同步修正 pinned 配额的旧数据计数：文本 `"false"` 不再被当成已钉选，同一 bucket ID 的物理副本只计一次，归档/删除终态不占名额。
+- 统一高重要度占位判定到 trace、Dashboard 快速解钉/完整编辑、导入复核、历史对话导入和单条/批量恢复浮现；所有从特殊/隐藏状态重新进入普通高重要度池的转换都会在同一配额锁内检查并落盘。新建或合并把低重要度桶提升到 9+ 时也不再绕过硬上限。
+- 修复配额/同内容写入队列中等待请求被取消后可能阻塞后续请求或提前打开串行屏障的问题；取消现在不会传播到前序 Future，交接回调也不会在非重入锁内自死锁。
+- 归档和软删除现在是存储层终态：快速钉选、Dashboard 编辑、导入复核或并发普通更新都不能再把 archived/deleted/tombstone 桶意外迁回活跃目录。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.4`，Dashboard、运行时和热更新检查显示一致。
+
 ## 2.7.3
 
 ### 新增 / Added

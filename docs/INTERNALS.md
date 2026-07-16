@@ -1336,6 +1336,10 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 
 **permanent 与 pinned 的配额关系**：配额唯一真相是 `metadata.pinned=True`。`type=="permanent"` 是独立的固化类型，不会仅因目录或 type 占用 `limits.max_pinned`（默认 20）；只有真正 pinned 的桶占配额并锁定 importance=10。`feel` / `plan` / `letter` 同样不占该配额。
 
+`pinned` 计数按逻辑 bucket ID 去重，并通过 `parse_bool` 解释历史 YAML 布尔值；archived/deleted/tombstone 是终态，不占 pinned 名额，也不能通过常规 `BucketManager.update()`、Dashboard 或导入复核重新激活。
+
+**importance≥9 配额口径**：只统计能被 `breath_advanced(importance_min=9)` 审计的普通记忆，再排除走独立配额的 `pinned/protected`。因此 `dont_surface`、`feel/plan/letter`、archived/deleted/tombstone 不占该池；显式且未 pinned 的 `permanent` 仍属于普通高重要度候选。历史恢复或手工文件可能产生同 ID 的物理副本，配额始终按逻辑 bucket ID 只计一次。取消钉选、恢复浮现、特殊类型转回 dynamic/permanent、历史对话在线导入，以及新建/合并导致 importance 升到 9+ 时，资格检查和写盘必须在同一个 `high_importance` quota turn 内完成。备份迁移、`write_memory.py` 和手工 Markdown 属于受信任的保真/维护入口，允许原样恢复或直接修订数据，不适用在线写入配额。
+
 (实现注意：`pinned` 和 `protected` 在代码里几乎等价处理，但 `protected` 是历史遗留字段，新桶不应再写；UI 只暴露 pinned。)
 
 ---

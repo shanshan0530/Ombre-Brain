@@ -7,13 +7,19 @@
 
 本文件用 asyncio.gather 真实并发触发这条路径，锁死「即使并发也不能破配额」。
 """
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import asyncio
 import pytest
 
 import tools._runtime as rt
-from tools._common import count_high_importance, count_pinned, merge_or_create
+from tools._common import (
+    _quota_turn,
+    count_high_importance,
+    count_pinned,
+    merge_or_create,
+)
 from tools.hold.pinned import store_pinned
 from tools.trace.core import trace_core
 
@@ -85,6 +91,79 @@ async def test_concurrent_trace_promote_does_not_exceed_cap(bucket_mgr, monkeypa
         if b["metadata"]["importance"] == 9:
             promoted += 1
     assert promoted == 1, f"应该只有 1 个并发 trace 真正提到 9，实际 {promoted} 个"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_unhide_and_promote_cannot_bypass_high_cap(
+    bucket_mgr,
+    monkeypatch,
+):
+    install_runtime(bucket_mgr)
+    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
+
+    await bucket_mgr.create(content="existing visible high", importance=9)
+    target_id = await bucket_mgr.create(content="hidden low target", importance=5)
+    await bucket_mgr.update(target_id, dont_surface=True)
+
+    await asyncio.gather(
+        trace_core(target_id, dont_surface=0),
+        trace_core(target_id, importance=9),
+    )
+
+    target = await bucket_mgr.get(target_id)
+    target_meta = target["metadata"]
+    visible_high = (
+        not bool(target_meta.get("dont_surface"))
+        and int(target_meta.get("importance") or 0) >= 9
+    )
+    assert visible_high is False
+    assert await count_high_importance() == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_quota_waiter_does_not_poison_or_open_the_turn(
+    monkeypatch,
+):
+    # Exercise the in-process Future chain directly.  Without a base_dir there
+    # is no filesystem lock to hide a broken cancellation hand-off.
+    monkeypatch.setattr(rt, "bucket_mgr", SimpleNamespace(base_dir=""))
+    key = "cancelled-waiter-regression"
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    third_entered = asyncio.Event()
+
+    async def holder():
+        async with _quota_turn(key):
+            first_entered.set()
+            await release_first.wait()
+
+    async def cancelled_waiter():
+        second_started.set()
+        async with _quota_turn(key):
+            pytest.fail("cancelled waiter must not enter the quota turn")
+
+    async def final_waiter():
+        async with _quota_turn(key):
+            third_entered.set()
+
+    first = asyncio.create_task(holder())
+    await first_entered.wait()
+    second = asyncio.create_task(cancelled_waiter())
+    await second_started.wait()
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+    third = asyncio.create_task(final_waiter())
+    await asyncio.sleep(0)
+    assert third_entered.is_set() is False
+
+    release_first.set()
+    await first
+    await asyncio.wait_for(third, timeout=1)
+    assert third_entered.is_set() is True
 
 
 @pytest.mark.asyncio

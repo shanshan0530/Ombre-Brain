@@ -187,6 +187,25 @@ async def test_dashboard_edit_rejects_unknown_fields_without_partial_write(monke
 
 
 @pytest.mark.asyncio
+async def test_dashboard_edit_rejects_archived_bucket_without_resurrecting_it(
+    monkeypatch,
+):
+    manager = MutableBucketManager(_row(bucket_type="archived"))
+    handler = _edit_handler(monkeypatch, manager)
+
+    response = await handler(
+        JsonRequest("bucket-1", {"name": "must stay archived", "pinned": True})
+    )
+
+    payload = _json(response)
+    assert response.status_code == 409
+    assert payload["conflict"] == "archived"
+    assert payload["updated"] == []
+    assert manager.updates == []
+    assert manager.row["metadata"]["type"] == "archived"
+
+
+@pytest.mark.asyncio
 async def test_dashboard_edit_reports_manager_ignored_field_as_not_applied(monkeypatch):
     manager = MutableBucketManager(_row(), apply_updates=False)
     handler = _edit_handler(monkeypatch, manager)
@@ -369,27 +388,31 @@ async def test_dashboard_edit_requires_explicit_compatible_unpin_transition(
 async def test_dashboard_pin_holds_shared_quota_lock_through_check_and_write(
     monkeypatch,
 ):
-    state = {"inside": False, "events": []}
+    state = {"held": [], "events": []}
 
     @asynccontextmanager
     async def quota_turn(name):
-        assert name == "pinned"
-        assert state["inside"] is False
-        state["inside"] = True
-        state["events"].append("enter")
+        if name == "pinned":
+            assert state["held"] == []
+        else:
+            assert name == "high_importance"
+            assert state["held"] == ["pinned"]
+        state["held"].append(name)
+        state["events"].append(f"enter:{name}")
         try:
             yield
         finally:
-            state["events"].append("exit")
-            state["inside"] = False
+            assert state["held"][-1] == name
+            state["events"].append(f"exit:{name}")
+            state["held"].pop()
 
     async def check_quota():
-        assert state["inside"] is True
+        assert state["held"] == ["pinned", "high_importance"]
         state["events"].append("check")
         return None
 
     def on_update(_updates):
-        assert state["inside"] is True
+        assert state["held"] == ["pinned", "high_importance"]
         state["events"].append("write")
 
     manager = MutableBucketManager(_row(), on_update=on_update)
@@ -406,7 +429,14 @@ async def test_dashboard_pin_holds_shared_quota_lock_through_check_and_write(
 
     assert response.status_code == 200
     assert _json(response)["updated"] == ["type", "importance", "pinned"]
-    assert state["events"] == ["enter", "check", "write", "exit"]
+    assert state["events"] == [
+        "enter:pinned",
+        "enter:high_importance",
+        "check",
+        "write",
+        "exit:high_importance",
+        "exit:pinned",
+    ]
     assert manager.updates == [{"pinned": True}]
 
 
@@ -517,6 +547,99 @@ async def test_dashboard_high_importance_edit_enforces_quota_inside_write_lock(
     assert response.status_code == 200
     assert _json(response)["updated"] == ["importance"]
     assert state["events"] == ["enter", "enforce", "write", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_unforget_reserves_high_importance_slot(monkeypatch):
+    state = {"inside": False}
+
+    @asynccontextmanager
+    async def quota_turn(name):
+        assert name == "high_importance"
+        state["inside"] = True
+        try:
+            yield
+        finally:
+            state["inside"] = False
+
+    async def enforce_high_importance(importance):
+        assert state["inside"] is True
+        assert importance == 10
+        return 8
+
+    def on_update(updates):
+        assert state["inside"] is True
+        assert updates == {"dont_surface": False, "importance": 8}
+
+    row = _row(importance=10)
+    row["metadata"]["dont_surface"] = True
+    manager = MutableBucketManager(row, on_update=on_update)
+    handler = _edit_handler(monkeypatch, manager)
+    monkeypatch.setattr(import_api, "_quota_turn", quota_turn)
+    monkeypatch.setattr(
+        import_api,
+        "_enforce_high_importance_quota",
+        enforce_high_importance,
+    )
+
+    response = await handler(JsonRequest("bucket-1", {"dont_surface": False}))
+
+    payload = _json(response)
+    assert response.status_code == 200
+    assert payload["updated"] == ["importance", "dont_surface"]
+    assert payload["quota_adjustment"] == {
+        "field": "importance",
+        "requested": 10,
+        "applied": 8,
+    }
+
+
+@pytest.mark.asyncio
+async def test_dashboard_special_to_dynamic_transition_reserves_high_slot(
+    monkeypatch,
+):
+    state = {"inside": False}
+
+    @asynccontextmanager
+    async def quota_turn(name):
+        assert name == "high_importance"
+        state["inside"] = True
+        try:
+            yield
+        finally:
+            state["inside"] = False
+
+    async def enforce_high_importance(importance):
+        assert state["inside"] is True
+        assert importance == 9
+        return 8
+
+    def on_update(updates):
+        assert state["inside"] is True
+        assert updates == {"type": "dynamic", "importance": 8}
+
+    manager = MutableBucketManager(
+        _row(bucket_type="feel", importance=9),
+        on_update=on_update,
+    )
+    handler = _edit_handler(monkeypatch, manager)
+    monkeypatch.setattr(import_api, "_quota_turn", quota_turn)
+    monkeypatch.setattr(
+        import_api,
+        "_enforce_high_importance_quota",
+        enforce_high_importance,
+    )
+
+    response = await handler(JsonRequest("bucket-1", {"type": "dynamic"}))
+
+    payload = _json(response)
+    assert response.status_code == 200
+    assert payload["updated"] == ["type", "importance"]
+    assert payload["quota_adjustment"] == {
+        "field": "importance",
+        "requested": 9,
+        "applied": 8,
+    }
 
 
 @pytest.mark.asyncio

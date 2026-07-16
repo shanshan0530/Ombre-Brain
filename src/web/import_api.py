@@ -47,6 +47,8 @@ try:
         check_content_size as _check_content_size,
         check_pinned_quota as _check_pinned_quota,
         enforce_high_importance_quota as _enforce_high_importance_quota,
+        is_terminal_memory_metadata as _is_terminal_memory_metadata,
+        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
     )
 except ImportError:  # pragma: no cover
     from ..tools._common import (  # type: ignore
@@ -55,6 +57,8 @@ except ImportError:  # pragma: no cover
         check_content_size as _check_content_size,
         check_pinned_quota as _check_pinned_quota,
         enforce_high_importance_quota as _enforce_high_importance_quota,
+        is_terminal_memory_metadata as _is_terminal_memory_metadata,
+        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
     )
 
 try:
@@ -702,19 +706,18 @@ def register(mcp) -> None:
                             parse_bool(metadata.get("pinned"), default=False)
                             or parse_bool(metadata.get("protected"), default=False)
                         )
-                        bucket_type = str(
-                            metadata.get("type") or "dynamic"
-                        ).strip().lower()
                         target_importance = 9
                         if pinned_or_protected and current_importance >= 9:
                             # Importance is locked, but the requested semantic is
                             # already satisfied; keep the idempotent action.
                             target_importance = current_importance
-                        elif (
-                            current_importance < _HIGH_IMP_THRESHOLD
-                            and not pinned_or_protected
-                            and bucket_type not in {"letter", "archived"}
-                        ):
+                        projected_metadata = dict(metadata)
+                        projected_metadata["importance"] = target_importance
+                        reserves_high_importance = (
+                            _occupies_high_importance_slot(projected_metadata)
+                            and not _occupies_high_importance_slot(metadata)
+                        )
+                        if reserves_high_importance:
                             target_importance = (
                                 await _enforce_high_importance_quota(9)
                             )
@@ -747,13 +750,24 @@ def register(mcp) -> None:
                                 errors += 1
                                 continue
                 elif action == "pin":
-                    async with _quota_turn("pinned"):
+                    async with AsyncExitStack() as quota_stack:
+                        await quota_stack.enter_async_context(
+                            _quota_turn("pinned")
+                        )
+                        await quota_stack.enter_async_context(
+                            _quota_turn("high_importance")
+                        )
                         bucket = await sh.bucket_mgr.get(bid)
                         if not bucket:
                             errors += 1
                             continue
+                        metadata = bucket.get("metadata", {})
+                        if _is_terminal_memory_metadata(metadata):
+                            errors += 1
+                            continue
                         already_pinned = parse_bool(
-                            bucket.get("metadata", {}).get("pinned"),
+                            metadata.get("pinned")
+                            if isinstance(metadata, dict) else None,
                             default=False,
                         )
                         if not already_pinned:
@@ -891,6 +905,12 @@ def register(mcp) -> None:
         metadata = bucket.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
+        if _is_terminal_memory_metadata(metadata):
+            return reject(
+                "archived buckets cannot be edited",
+                status_code=409,
+                conflict="archived",
+            )
 
         bool_fields = {"resolved", "pinned", "digested", "dont_surface"}
 
@@ -1128,29 +1148,44 @@ def register(mcp) -> None:
             else int(updates.get("importance", before_values["importance"]))
         )
 
-        def occupies_high_importance_slot(
-            *, importance: int, pinned: bool, bucket_type: str
-        ) -> bool:
-            return (
-                importance >= _HIGH_IMP_THRESHOLD
-                and not pinned
-                and not protected
-                and bucket_type not in {"letter", "archived"}
-            )
-
-        occupied_high_before = occupies_high_importance_slot(
-            importance=before_values["importance"],
-            pinned=current_pinned,
-            bucket_type=current_type,
+        before_quota_metadata = dict(metadata)
+        before_quota_metadata.update({
+            "importance": before_values["importance"],
+            "pinned": current_pinned,
+            "protected": protected,
+            "type": current_type,
+            "dont_surface": before_values["dont_surface"],
+        })
+        after_quota_metadata = dict(before_quota_metadata)
+        after_quota_metadata.update({
+            "importance": final_importance,
+            "pinned": requested_pinned,
+            "type": final_type,
+            "dont_surface": updates.get(
+                "dont_surface", before_values["dont_surface"]
+            ),
+        })
+        occupied_high_before = _occupies_high_importance_slot(
+            before_quota_metadata
         )
-        occupies_high_after = occupies_high_importance_slot(
-            importance=final_importance,
-            pinned=requested_pinned,
-            bucket_type=final_type,
+        occupies_high_after = _occupies_high_importance_slot(
+            after_quota_metadata
         )
         reserves_high_importance = occupies_high_after and not occupied_high_before
+        eligibility_field_changed = (
+            pin_state_changed
+            or final_type != current_type
+            or after_quota_metadata["dont_surface"]
+            != before_values["dont_surface"]
+        )
+        importance_changed = final_importance != before_values["importance"]
         needs_high_importance_lock = (
-            occupied_high_before or occupies_high_after
+            eligibility_field_changed
+            or (
+                importance_changed
+                and max(final_importance, before_values["importance"])
+                >= _HIGH_IMP_THRESHOLD
+            )
         )
 
         if not updates:
@@ -1194,6 +1229,7 @@ def register(mcp) -> None:
                         "protected": protected,
                         "type": current_type,
                         "importance": before_values["importance"],
+                        "dont_surface": before_values["dont_surface"],
                     }
                     locked_quota_state = {
                         "pinned": bucket_value(locked_bucket, "pinned"),
@@ -1202,6 +1238,9 @@ def register(mcp) -> None:
                         ),
                         "type": bucket_value(locked_bucket, "type"),
                         "importance": bucket_value(locked_bucket, "importance"),
+                        "dont_surface": bucket_value(
+                            locked_bucket, "dont_surface"
+                        ),
                     }
                     changed_quota_fields = [
                         field for field in before_quota_state
@@ -1260,6 +1299,15 @@ def register(mcp) -> None:
 
                 ok = await sh.bucket_mgr.update(bucket_id, **updates)
                 if not ok:
+                    latest = await sh.bucket_mgr.get(bucket_id)
+                    if _is_terminal_memory_metadata(
+                        (latest or {}).get("metadata", {})
+                    ):
+                        return reject(
+                            "bucket was archived concurrently",
+                            status_code=409,
+                            conflict="archived",
+                        )
                     return reject("update failed", status_code=500)
                 persisted_bucket = await sh.bucket_mgr.get(bucket_id)
                 if not persisted_bucket:

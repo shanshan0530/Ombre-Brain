@@ -83,6 +83,64 @@ async def test_type_update_rejects_archived_and_keeps_source_unchanged(bucket_mg
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"name": "must not edit archived"},
+        {"pinned": True},
+        {"type": "dynamic"},
+    ],
+)
+async def test_archived_bucket_is_terminal_for_all_regular_updates(
+    bucket_mgr,
+    updates,
+):
+    bucket_id = await bucket_mgr.create(
+        content="terminal archived memory",
+        domain=["migration-domain"],
+        bucket_type="dynamic",
+    )
+    assert await bucket_mgr.archive(bucket_id) is True
+    archived = await bucket_mgr.get(bucket_id)
+    archived_path = Path(archived["path"])
+    archived_bytes = archived_path.read_bytes()
+
+    assert await bucket_mgr.update(bucket_id, **updates) is False
+
+    unchanged = await bucket_mgr.get(bucket_id)
+    assert unchanged is not None
+    assert unchanged["metadata"]["type"] == "archived"
+    assert Path(unchanged["path"]) == archived_path
+    assert archived_path.read_bytes() == archived_bytes
+    assert _bucket_files(bucket_mgr, bucket_id) == [archived_path]
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_tombstone_cannot_be_resurrected_by_pin_update(
+    bucket_mgr,
+):
+    bucket_id = await bucket_mgr.create(
+        content="terminal tombstone memory",
+        domain=["migration-domain"],
+        bucket_type="dynamic",
+    )
+    assert await bucket_mgr.delete(bucket_id) is True
+    tombstone_files = _bucket_files(bucket_mgr, bucket_id)
+    assert len(tombstone_files) == 1
+    tombstone_path = tombstone_files[0]
+    tombstone_bytes = tombstone_path.read_bytes()
+
+    assert await bucket_mgr.update(bucket_id, pinned=True) is False
+
+    unchanged = frontmatter.load(tombstone_path)
+    assert unchanged.get("deleted_at")
+    assert unchanged.get("tombstone") is True
+    assert unchanged.get("pinned") is not True
+    assert tombstone_path.read_bytes() == tombstone_bytes
+    assert _bucket_files(bucket_mgr, bucket_id) == [tombstone_path]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("guard_field", ["pinned", "protected"])
 async def test_guarded_permanent_bucket_cannot_be_retyped_out_of_permanent(
     bucket_mgr,

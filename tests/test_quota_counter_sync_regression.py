@@ -12,6 +12,7 @@
 - pinned 只数 metadata.pinned，type=permanent 不占 pinned 配额；
   importance≥9 配额排除 pinned/protected。
 """
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,6 +23,7 @@ from tools._common import (
     count_pinned,
     enforce_high_importance_quota,
     enforce_pinned_quota,
+    merge_or_create,
 )
 from tools.trace.core import trace_core
 
@@ -38,6 +40,38 @@ def install_runtime(bucket_mgr, limits=None):
     rt.logger = MagicMock()
     rt.fire_webhook = None
     rt.mark_op = None
+
+
+class StaticBucketManager:
+    """Minimal counter fixture for legacy/imported physical row shapes."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def list_all(self, include_archive=False):
+        assert include_archive is False
+        return list(self.rows)
+
+
+def _quota_row(
+    bucket_id: str,
+    *,
+    importance=9,
+    bucket_type="dynamic",
+    pinned=False,
+    protected=False,
+    dont_surface=False,
+):
+    return {
+        "id": bucket_id,
+        "metadata": {
+            "importance": importance,
+            "type": bucket_type,
+            "pinned": pinned,
+            "protected": protected,
+            "dont_surface": dont_surface,
+        },
+    }
 
 
 # ------------------------------------------------------------
@@ -120,6 +154,23 @@ async def test_permanent_type_does_not_occupy_pinned_quota(bucket_mgr):
     assert await count_pinned() == 2
     # 2 < 3 → 还能钉
     assert await enforce_pinned_quota(True) is True
+
+
+@pytest.mark.asyncio
+async def test_pinned_counter_normalizes_booleans_and_logical_ids():
+    pinned = _quota_row("pinned", pinned=True, importance=10)
+    quoted_false = _quota_row(
+        "quoted-false", pinned="false", importance=10
+    )
+    archived = _quota_row("archived", pinned=True, importance=10)
+    archived["metadata"]["type"] = "archived"
+    install_runtime(
+        StaticBucketManager(
+            [pinned, pinned, quoted_false, archived]
+        )
+    )
+
+    assert await count_pinned() == 1
 
 
 # ------------------------------------------------------------
@@ -216,4 +267,151 @@ async def test_letter_does_not_occupy_high_importance_quota(bucket_mgr):
     await bucket_mgr.create(content="普通高重要", importance=9)
 
     # 只数普通桶那一条，letter 不占位
+    assert await count_high_importance() == 1
+
+
+@pytest.mark.asyncio
+async def test_high_importance_counter_matches_breath_audit_scope():
+    """Regression: the quota warning must not report 89 when only 18 are auditable."""
+    rows = [
+        *[_quota_row(f"ordinary-{index}") for index in range(18)],
+        *[
+            _quota_row(f"forgotten-{index}", dont_surface=True)
+            for index in range(50)
+        ],
+        *[_quota_row(f"feel-{index}", bucket_type="feel") for index in range(11)],
+        *[_quota_row(f"plan-{index}", bucket_type="plan") for index in range(10)],
+    ]
+    install_runtime(StaticBucketManager(rows))
+
+    assert len(rows) == 89
+    assert await count_high_importance() == 18
+
+
+@pytest.mark.asyncio
+async def test_high_importance_counter_counts_each_logical_bucket_id_once():
+    canonical = [_quota_row(f"bucket-{index}") for index in range(12)]
+    install_runtime(StaticBucketManager(canonical + canonical))
+
+    assert await count_high_importance() == 12
+
+
+@pytest.mark.asyncio
+async def test_high_importance_counter_normalizes_legacy_metadata_per_row():
+    visible = _quota_row("visible")
+    text_false = _quota_row("text-false", pinned="false")
+    text_true = _quota_row("text-true", pinned="true")
+    permanent = _quota_row("permanent", bucket_type="permanent", importance="10")
+    corrupt = _quota_row("corrupt", importance="not-a-number")
+    tombstone = _quota_row("tombstone")
+    tombstone["metadata"]["tombstone"] = True
+    deleted = _quota_row("deleted")
+    deleted["metadata"]["deleted_at"] = "2026-01-01T00:00:00Z"
+    install_runtime(
+        StaticBucketManager(
+            [visible, text_false, text_true, permanent, corrupt, tombstone, deleted]
+        )
+    )
+
+    # Explicit unpinned permanent is a first-class visible memory and counts;
+    # malformed/terminal rows do not zero the rest of the scan.
+    assert await count_high_importance() == 3
+
+
+@pytest.mark.asyncio
+async def test_trace_restore_hidden_high_importance_reserves_slot(
+    bucket_mgr,
+    monkeypatch,
+):
+    install_runtime(bucket_mgr)
+    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
+
+    await bucket_mgr.create(content="existing visible high", importance=9)
+    hidden_id = await bucket_mgr.create(content="hidden high", importance=10)
+    await bucket_mgr.update(hidden_id, dont_surface=True)
+
+    await trace_core(hidden_id, dont_surface=0)
+
+    restored = await bucket_mgr.get(hidden_id)
+    assert restored["metadata"]["dont_surface"] is False
+    assert restored["metadata"]["importance"] == 8
+    assert await count_high_importance() == 1
+
+
+@pytest.mark.asyncio
+async def test_merge_promotion_cannot_bypass_high_importance_cap(
+    bucket_mgr,
+    monkeypatch,
+):
+    install_runtime(bucket_mgr)
+    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
+
+    await bucket_mgr.create(content="existing visible high", importance=9)
+    target_id = await bucket_mgr.create(content="merge target", importance=5)
+    target = await bucket_mgr.get(target_id)
+    target["score"] = 100.0
+
+    async def find_target(*_args, **_kwargs):
+        return [target]
+
+    monkeypatch.setattr(bucket_mgr, "search", find_target)
+    merged_id, merged, _warning = await merge_or_create(
+        content="new merged event",
+        tags=[],
+        importance=9,
+        domain=[],
+        valence=0.5,
+        arousal=0.3,
+        raw_merge=True,
+        source_tool="hold",
+    )
+
+    persisted = await bucket_mgr.get(target_id)
+    assert merged is True
+    assert merged_id == target_id
+    assert persisted["metadata"]["importance"] == 8
+    assert await count_high_importance() == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_merge_promotions_preserve_both_events_and_one_slot(
+    bucket_mgr,
+    monkeypatch,
+):
+    install_runtime(bucket_mgr)
+    monkeypatch.setattr("tools._common._HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr("tools._common._HIGH_IMP_SOFT_WARN", 1)
+    target_id = await bucket_mgr.create(content="merge base", importance=5)
+
+    async def find_target(*_args, **_kwargs):
+        row = await bucket_mgr.get(target_id)
+        row["score"] = 100.0
+        return [row]
+
+    monkeypatch.setattr(bucket_mgr, "search", find_target)
+
+    async def merge_event(text):
+        return await merge_or_create(
+            content=text,
+            tags=[],
+            importance=9,
+            domain=[],
+            valence=0.5,
+            arousal=0.3,
+            raw_merge=True,
+            source_tool="hold",
+        )
+
+    results = await asyncio.gather(
+        merge_event("concurrent event A"),
+        merge_event("concurrent event B"),
+    )
+
+    persisted = await bucket_mgr.get(target_id)
+    assert all(result[:2] == (target_id, True) for result in results)
+    assert "concurrent event A" in persisted["content"]
+    assert "concurrent event B" in persisted["content"]
+    assert persisted["metadata"]["importance"] == 9
     assert await count_high_importance() == 1

@@ -28,10 +28,18 @@ import hashlib
 import logging
 import threading
 import uuid
+from contextlib import AsyncExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tools._common import (
+    _HIGH_IMP_THRESHOLD,
+    _quota_turn,
+    enforce_high_importance_quota,
+    is_terminal_memory_metadata,
+    occupies_high_importance_quota_slot,
+)
 from utils import atomic_write_text, clean_llm_json, count_tokens_approx, now_iso, parse_bool
 
 logger = logging.getLogger("ombre_brain.import")
@@ -880,6 +888,32 @@ class ImportEngine:
         )
         return self.state.to_dict()
 
+    async def _create_import_bucket(self, item: dict) -> str:
+        """Create one imported memory under the ordinary high quota."""
+        requested_importance = item.get(
+            "importance", _DEFAULT_IMPORTANCE
+        )
+
+        async def create(final_importance: int) -> str:
+            return await self.bucket_mgr.create(
+                content=item["content"],
+                tags=item.get("tags", []),
+                importance=final_importance,
+                domain=item.get("domain", ["未分类"]),
+                valence=item.get("valence", _DEFAULT_VALENCE),
+                arousal=item.get("arousal", _DEFAULT_AROUSAL),
+                name=item.get("name") or None,
+            )
+
+        if requested_importance >= _HIGH_IMP_THRESHOLD:
+            async with _quota_turn("high_importance"):
+                final_importance = await enforce_high_importance_quota(
+                    requested_importance,
+                    bucket_mgr=self.bucket_mgr,
+                )
+                return await create(final_importance)
+        return await create(requested_importance)
+
     async def _process_single_chunk(self, chunk: dict, preserve_raw: bool):
         """Extract memories from a single chunk and store them."""
         content = chunk["content"]
@@ -925,15 +959,7 @@ class ImportEngine:
                                 f"proceeding to store: {exc}"
                             )
                     # Raw mode: store original content without summarization
-                    await self.bucket_mgr.create(
-                        content=item["content"],
-                        tags=item.get("tags", []),
-                        importance=item.get("importance", _DEFAULT_IMPORTANCE),
-                        domain=item.get("domain", ["未分类"]),
-                        valence=item.get("valence", _DEFAULT_VALENCE),
-                        arousal=item.get("arousal", _DEFAULT_AROUSAL),
-                        name=item.get("name"),
-                    )
+                    await self._create_import_bucket(item)
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
                 else:
@@ -1069,37 +1095,143 @@ class ImportEngine:
         merge_threshold = self.config.get("merge_threshold") or _DEFAULT_MERGE_THRESHOLD
 
         if existing and existing[0].get("score", 0) > merge_threshold:
-            bucket = existing[0]
-            if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+            candidate = existing[0]
+            candidate_id = str(candidate.get("id") or "").strip()
+            candidate_metadata = candidate.get("metadata", {})
+            if not isinstance(candidate_metadata, dict):
+                candidate_metadata = {}
+            if candidate_id and not (
+                parse_bool(candidate_metadata.get("pinned"), default=False)
+                or parse_bool(
+                    candidate_metadata.get("protected"), default=False
+                )
+                or is_terminal_memory_metadata(candidate_metadata)
+            ):
                 try:
-                    merged = await self.dehydrator.merge(bucket["content"], content)
-                    self.state.data["api_calls"] += 1
-                    old_v = bucket["metadata"].get("valence") or _DEFAULT_VALENCE
-                    old_a = bucket["metadata"].get("arousal") or _DEFAULT_AROUSAL
-                    await self.bucket_mgr.update(
-                        bucket["id"],
-                        content=merged,
-                        tags=list(set((bucket["metadata"].get("tags") or []) + tags)),
-                        importance=max(bucket["metadata"].get("importance") or _DEFAULT_IMPORTANCE, importance),
-                        domain=list(set((bucket["metadata"].get("domain") or []) + domain)),
-                        valence=round((old_v + valence) / 2, 2),
-                        arousal=round((old_a + arousal) / 2, 2),
-                    )
-                    return True
+                    candidate_content = str(candidate.get("content") or "")
+                    try:
+                        merged = await self.dehydrator.merge(
+                            candidate_content, content
+                        )
+                    finally:
+                        self.state.data["api_calls"] += 1
+
+                    async with AsyncExitStack() as commit_stack:
+                        # An incoming 9/10 can promote an ordinary low bucket.
+                        # Hold the same global quota turn as MCP/Web writers
+                        # from the final re-read through the durable update.
+                        if importance >= _HIGH_IMP_THRESHOLD:
+                            await commit_stack.enter_async_context(
+                                _quota_turn("high_importance")
+                            )
+                        bucket_turn = getattr(
+                            self.bucket_mgr, "_bucket_turn", None
+                        )
+                        update_locked = getattr(
+                            self.bucket_mgr, "_update_locked", None
+                        )
+                        use_locked_update = callable(
+                            bucket_turn
+                        ) and callable(update_locked)
+                        if use_locked_update:
+                            await commit_stack.enter_async_context(
+                                bucket_turn(candidate_id)
+                            )
+
+                        get_bucket = getattr(self.bucket_mgr, "get", None)
+                        locked_bucket = (
+                            await get_bucket(candidate_id)
+                            if callable(get_bucket)
+                            else candidate
+                        )
+                        if (
+                            not locked_bucket
+                            or str(locked_bucket.get("content") or "")
+                            != candidate_content
+                        ):
+                            raise RuntimeError(
+                                "merge target changed concurrently"
+                            )
+                        locked_metadata = locked_bucket.get("metadata", {})
+                        if not isinstance(locked_metadata, dict):
+                            locked_metadata = {}
+                        if (
+                            parse_bool(
+                                locked_metadata.get("pinned"), default=False
+                            )
+                            or parse_bool(
+                                locked_metadata.get("protected"), default=False
+                            )
+                            or is_terminal_memory_metadata(locked_metadata)
+                        ):
+                            raise RuntimeError(
+                                "merge target became pinned or protected"
+                            )
+
+                        try:
+                            old_importance = int(
+                                locked_metadata.get("importance")
+                                or _DEFAULT_IMPORTANCE
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            old_importance = _DEFAULT_IMPORTANCE
+                        merged_importance = max(old_importance, importance)
+                        projected_metadata = dict(locked_metadata)
+                        projected_metadata["importance"] = merged_importance
+                        if (
+                            occupies_high_importance_quota_slot(
+                                projected_metadata
+                            )
+                            and not occupies_high_importance_quota_slot(
+                                locked_metadata
+                            )
+                        ):
+                            merged_importance = (
+                                await enforce_high_importance_quota(
+                                    merged_importance,
+                                    bucket_mgr=self.bucket_mgr,
+                                )
+                            )
+
+                        old_v = (
+                            locked_metadata.get("valence")
+                            or _DEFAULT_VALENCE
+                        )
+                        old_a = (
+                            locked_metadata.get("arousal")
+                            or _DEFAULT_AROUSAL
+                        )
+                        update_method = (
+                            update_locked
+                            if use_locked_update
+                            else self.bucket_mgr.update
+                        )
+                        committed = await update_method(
+                            candidate_id,
+                            content=merged,
+                            tags=list(
+                                set(
+                                    (locked_metadata.get("tags") or [])
+                                    + tags
+                                )
+                            ),
+                            importance=merged_importance,
+                            domain=list(
+                                set(
+                                    (locked_metadata.get("domain") or [])
+                                    + domain
+                                )
+                            ),
+                            valence=round((old_v + valence) / 2, 2),
+                            arousal=round((old_a + arousal) / 2, 2),
+                        )
+                        if committed:
+                            return True
                 except Exception as e:
                     logger.warning(f"Merge failed during import: {e}")
-                    self.state.data["api_calls"] += 1
 
         # Create new
-        await self.bucket_mgr.create(
-            content=content,
-            tags=tags,
-            importance=importance,
-            domain=domain,
-            valence=valence,
-            arousal=arousal,
-            name=name or None,
-        )
+        await self._create_import_bucket(item)
         return False
 
     async def detect_patterns(self) -> list[dict]:

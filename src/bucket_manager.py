@@ -1657,6 +1657,20 @@ class BucketManager:
         was_pinned = parse_bool(post.get("pinned", False), default=False)
         is_protected = parse_bool(post.get("protected", False), default=False)
         current_type = str(post.get("type") or "dynamic").strip().lower()
+        if (
+            current_type == "archived"
+            or post.get("deleted_at")
+            or parse_bool(post.get("tombstone"), default=False)
+        ):
+            # Archive is a terminal lifecycle transition.  Allowing an
+            # ordinary update here is unsafe even when ``type`` was omitted:
+            # pinned=True forces type=permanent below and could otherwise
+            # resurrect an archived file into the active tree.
+            logger.warning(
+                "update() rejected mutation on terminal bucket=%s",
+                bucket_id,
+            )
+            return False
         will_be_pinned = parse_bool(
             kwargs.get("pinned", was_pinned), default=was_pinned
         )
@@ -1671,13 +1685,6 @@ class BucketManager:
                     bucket_id,
                 )
                 return False
-            if current_type == "archived":
-                logger.warning(
-                    "update() rejected type change on archived bucket=%s",
-                    bucket_id,
-                )
-                return False
-
         forced_type: str | None = None
         if will_be_pinned:
             forced_type = "permanent"

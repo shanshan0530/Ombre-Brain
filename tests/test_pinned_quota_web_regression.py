@@ -106,6 +106,23 @@ async def test_bucket_pin_route_rejects_new_pin_when_quota_is_full(pinned_quota_
 
 
 @pytest.mark.asyncio
+async def test_bucket_pin_route_rejects_archived_bucket(pinned_quota_runtime):
+    metadata = pinned_quota_runtime.rows["plain"]["metadata"]
+    metadata["type"] = "archived"
+    mcp = FakeMcp()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes["/api/bucket/{bucket_id}/pin"](
+        FakeRequest(path_params={"bucket_id": "plain"})
+    )
+
+    assert response.status_code == 409
+    assert metadata["type"] == "archived"
+    assert metadata["pinned"] is False
+    assert pinned_quota_runtime.updates == []
+
+
+@pytest.mark.asyncio
 async def test_import_review_pin_action_respects_pinned_quota(pinned_quota_runtime):
     mcp = FakeMcp()
     import_api.register(mcp)
@@ -118,6 +135,24 @@ async def test_import_review_pin_action_respects_pinned_quota(pinned_quota_runti
     assert _json(response)["applied"] == 0
     assert _json(response)["errors"] == 1
     assert pinned_quota_runtime.rows["plain"]["metadata"]["pinned"] is False
+    assert pinned_quota_runtime.updates == []
+
+
+@pytest.mark.asyncio
+async def test_import_review_pin_rejects_archived_bucket(pinned_quota_runtime):
+    metadata = pinned_quota_runtime.rows["plain"]["metadata"]
+    metadata["type"] = "archived"
+    mcp = FakeMcp()
+    import_api.register(mcp)
+
+    response = await mcp.routes["/api/import/review"](
+        FakeRequest(body={"decisions": [{"bucket_id": "plain", "action": "pin"}]})
+    )
+
+    assert response.status_code == 200
+    assert _json(response) == {"applied": 0, "errors": 1}
+    assert metadata["type"] == "archived"
+    assert metadata["pinned"] is False
     assert pinned_quota_runtime.updates == []
 
 
@@ -139,6 +174,159 @@ async def test_import_review_important_action_rejects_when_high_quota_is_full(
     assert response.status_code == 200
     assert _json(response) == {"applied": 0, "errors": 1}
     assert pinned_quota_runtime.rows["plain"]["metadata"]["importance"] == 5
+
+
+@pytest.mark.asyncio
+async def test_import_review_special_bucket_does_not_consume_ordinary_high_slot(
+    pinned_quota_runtime,
+    monkeypatch,
+):
+    high = pinned_quota_runtime.rows["already-pinned"]["metadata"]
+    high.update({"pinned": False, "type": "dynamic", "importance": 9})
+    special = pinned_quota_runtime.rows["plain"]["metadata"]
+    special.update({"type": "feel", "importance": 5})
+    monkeypatch.setattr(common, "_HIGH_IMP_HARD_CAP", 1)
+    mcp = FakeMcp()
+    import_api.register(mcp)
+
+    response = await mcp.routes["/api/import/review"](
+        FakeRequest(body={"decisions": [{"bucket_id": "plain", "action": "important"}]})
+    )
+
+    assert response.status_code == 200
+    assert _json(response) == {"applied": 1, "errors": 0}
+    assert special["importance"] == 9
+
+
+@pytest.mark.asyncio
+async def test_bucket_unpin_ignores_hidden_and_special_high_rows(
+    pinned_quota_runtime,
+    monkeypatch,
+):
+    for index in range(30):
+        row = FakeBucketManager._row(
+            f"hidden-{index}", pinned=False, bucket_type="dynamic"
+        )
+        row["metadata"].update({"importance": 9, "dont_surface": True})
+        pinned_quota_runtime.rows[row["id"]] = row
+    for index in range(30):
+        row = FakeBucketManager._row(
+            f"feel-{index}", pinned=False, bucket_type="feel"
+        )
+        row["metadata"]["importance"] = 9
+        pinned_quota_runtime.rows[row["id"]] = row
+    monkeypatch.setattr(common, "_HIGH_IMP_HARD_CAP", 1)
+    mcp = FakeMcp()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes["/api/bucket/{bucket_id}/pin"](
+        FakeRequest(path_params={"bucket_id": "already-pinned"})
+    )
+
+    assert response.status_code == 200
+    payload = _json(response)
+    assert payload["pinned"] is False
+    assert payload["importance"] == 10
+    assert pinned_quota_runtime.updates[-1] == (
+        "already-pinned",
+        {"pinned": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_unforget_reserves_high_importance_slot(
+    pinned_quota_runtime,
+    monkeypatch,
+):
+    existing = pinned_quota_runtime.rows["already-pinned"]["metadata"]
+    existing.update({"pinned": False, "type": "dynamic", "importance": 9})
+    hidden = pinned_quota_runtime.rows["plain"]["metadata"]
+    hidden.update({"importance": 10, "dont_surface": True})
+    monkeypatch.setattr(common, "_HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr(common, "_HIGH_IMP_SOFT_WARN", 1)
+    mcp = FakeMcp()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes["/api/bucket/{bucket_id}/forget"](
+        FakeRequest(path_params={"bucket_id": "plain"})
+    )
+
+    assert response.status_code == 200
+    assert _json(response)["quota_adjustment"] == {
+        "requested": 10,
+        "applied": 8,
+    }
+    assert hidden["dont_surface"] is False
+    assert hidden["importance"] == 8
+
+
+@pytest.mark.asyncio
+async def test_batch_unforget_serializes_each_new_high_slot(
+    pinned_quota_runtime,
+    monkeypatch,
+):
+    first = pinned_quota_runtime.rows["already-pinned"]["metadata"]
+    first.update({
+        "pinned": False,
+        "type": "dynamic",
+        "importance": 9,
+        "dont_surface": True,
+    })
+    second = pinned_quota_runtime.rows["plain"]["metadata"]
+    second.update({"importance": 10, "dont_surface": True})
+    monkeypatch.setattr(common, "_HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr(common, "_HIGH_IMP_SOFT_WARN", 1)
+    mcp = FakeMcp()
+    buckets_web.register(mcp)
+
+    response = await mcp.routes["/api/buckets/forget"](
+        FakeRequest(
+            body={
+                "ids": ["already-pinned", "plain"],
+                "dont_surface": False,
+            }
+        )
+    )
+
+    payload = _json(response)
+    assert response.status_code == 200
+    assert payload["updated"] == ["already-pinned", "plain"]
+    assert payload["quota_adjustments"] == [
+        {"id": "plain", "requested": 10, "applied": 8}
+    ]
+    assert first["dont_surface"] is False
+    assert first["importance"] == 9
+    assert second["dont_surface"] is False
+    assert second["importance"] == 8
+
+
+@pytest.mark.asyncio
+async def test_concurrent_unpin_and_unforget_cannot_create_unchecked_high_slot(
+    pinned_quota_runtime,
+    monkeypatch,
+):
+    existing = pinned_quota_runtime.rows["plain"]["metadata"]
+    existing.update({"type": "dynamic", "importance": 9})
+    target = pinned_quota_runtime.rows["already-pinned"]["metadata"]
+    target["dont_surface"] = True
+    monkeypatch.setattr(common, "_HIGH_IMP_HARD_CAP", 1)
+    monkeypatch.setattr(common, "_HIGH_IMP_SOFT_WARN", 1)
+    mcp = FakeMcp()
+    buckets_web.register(mcp)
+
+    responses = await asyncio.gather(
+        mcp.routes["/api/bucket/{bucket_id}/pin"](
+            FakeRequest(path_params={"bucket_id": "already-pinned"})
+        ),
+        mcp.routes["/api/bucket/{bucket_id}/forget"](
+            FakeRequest(path_params={"bucket_id": "already-pinned"})
+        ),
+    )
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert target["pinned"] is False
+    assert target["dont_surface"] is False
+    assert target["importance"] == 8
 
 
 @pytest.mark.asyncio

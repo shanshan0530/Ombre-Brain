@@ -37,13 +37,9 @@ async def test_hold_dispatch_records_v3_tool_event_without_content_body(monkeypa
     async def fake_store_core(**_kwargs):
         return "hold result"
 
-    async def fake_importance_quota(importance):
-        return importance
-
     rt.init(config={}, decay_engine=_Decay(), mark_op=None)
     monkeypatch.setattr(rt, "record_v3_tool_event", lambda name, payload: calls.append((name, payload)))
     monkeypatch.setattr(hold_mod, "check_content_size", lambda _content: None)
-    monkeypatch.setattr(hold_mod, "enforce_high_importance_quota", fake_importance_quota)
     monkeypatch.setattr(hold_mod, "store_core", fake_store_core)
 
     result = await hold_mod.dispatch(content="private memory body", tags="x,y", importance=7)
