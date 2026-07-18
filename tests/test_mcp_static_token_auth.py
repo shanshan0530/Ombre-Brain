@@ -126,23 +126,20 @@ async def test_token_mode_401_challenge_has_no_oauth_resource_metadata():
 
 
 @pytest.mark.asyncio
-async def test_oauth_mode_ignores_custom_header_fallback():
-    """默认 oauth 模式回归：自定义请求头不应绕过 OAuth Bearer 校验。"""
+async def test_oauth_mode_accepts_orangechat_custom_header_fallback():
+    """Hybrid deployment keeps OAuth while allowing OrangeChat's static token."""
     downstream = RecordingASGIApp()
     middleware = MCPAuthMiddleware(
         downstream,
         auth_required=True,
         auth_mode="oauth",
-        token_validator=lambda *_a, **_k: False,
+        token_validator=lambda token, **_kwargs: token == "orangechat-secret",
     )
-    messages = []
+    scope = _scope([(b"ombre-mcp-token", b"orangechat-secret")])
 
-    await middleware(
-        _scope([(b"ombre-mcp-token", b"whatever")]), _empty_receive, _collect_into(messages)
-    )
+    await middleware(scope, _empty_receive, _discard_send)
 
-    assert downstream.scopes == []
-    assert messages[0]["status"] == 401
+    assert downstream.scopes == [scope]
 
 
 def test_http_runtime_settings_defaults_and_reads_auth_mode():
