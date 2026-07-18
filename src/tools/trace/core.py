@@ -33,7 +33,7 @@ import math
 from contextlib import AsyncExitStack
 from typing import Optional
 
-from memory_messages import resolved_hint
+from ombrebrain.domain.memory_messages import resolved_hint
 from utils import parse_bool
 from .. import _runtime as rt
 from .._common import (

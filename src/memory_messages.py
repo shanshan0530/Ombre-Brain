@@ -1,8 +1,8 @@
-"""Shared user-facing wording for memory state transitions."""
+"""Compatibility import for the packaged memory-state wording helpers.
 
+New code should import from :mod:`ombrebrain.domain.memory_messages`.
+"""
 
-def resolved_hint(resolved: bool) -> str:
-    """Return the canonical hint for resolved state changes."""
-    if resolved:
-        return "已沉底，只在关键词触发时重新浮现"
-    return "已重新激活，将参与浮现排序"
+from ombrebrain.domain.memory_messages import resolved_hint
+
+__all__ = ["resolved_hint"]
