@@ -223,8 +223,8 @@ class MCPAuthMiddleware:
             valid = bool(bearer_token) and self.token_validator(
                 bearer_token, resource=resource
             )
-            if not valid and self.auth_mode == "token":
-                # Fallback header for MCP clients that can't customize Authorization.
+            if not valid:
+                # Fallback header for OrangeChat and MCP clients that cannot use OAuth Authorization.
                 alt_token = headers.get(b"ombre-mcp-token", b"").decode(
                     "latin-1"
                 ).strip()
