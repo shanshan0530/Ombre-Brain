@@ -48,7 +48,7 @@ from ombrebrain.eventsourcing.ledger_property import LedgerReplayPropertyRunner
 from ombrebrain.eventsourcing.ledger_replay import LedgerReplayValidator
 from ombrebrain.projection.projection_mirror import TraceCatalogProjection
 from ombrebrain.projection.projection_sqlite import TraceSQLiteProjection
-from projection_vector import TraceVectorProjectionManifest
+from ombrebrain.projection.projection_vector import TraceVectorProjectionManifest
 
 
 @dataclass(frozen=True)
