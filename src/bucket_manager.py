@@ -228,7 +228,7 @@ from utils import (
     parse_bool,
     parse_iso_datetime,
 )
-from media_store import MediaStore
+from ombrebrain.storage.media_store import MediaStore
 from ombrebrain.retrieval.bucket_scoring import (
     calc_topic_score,
     calc_emotion_score,

@@ -92,3 +92,11 @@ def test_bucket_scoring_legacy_imports_are_canonical_functions():
         "memory",
         {"metadata": {"name": "memory"}, "content": "body"},
     ) <= 1.0
+
+
+def test_media_store_legacy_imports_are_canonical_classes():
+    import media_store as legacy
+    from ombrebrain.storage import media_store
+
+    assert legacy.MediaStore is media_store.MediaStore
+    assert legacy.MediaPersistenceError is media_store.MediaPersistenceError

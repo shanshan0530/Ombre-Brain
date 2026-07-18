@@ -48,6 +48,14 @@
 `embedding_outbox.py`、`projection_*`、`ledger_*`。这些模块需逐个确认文件系统、
 数据库、锁和后台任务状态不会因双重导入而复制。
 
+当前逐文件顺序：
+
+- [x] `media_store.py` → `ombrebrain/storage/media_store.py`
+- [ ] `vault_health.py`
+- [ ] `backup_archive.py`
+- [ ] `embedding_outbox.py`
+- [ ] `projection_*` 与 `ledger_*`（每个文件仍单独迁移）
+
 ### 阶段 C：引擎与大型有状态模块
 
 依次评估 `embedding_engine.py`、`decay_engine.py`、`github_sync.py`、
