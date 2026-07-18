@@ -53,7 +53,7 @@
 - [x] `media_store.py` → `ombrebrain/storage/media_store.py`
 - [x] `vault_health.py` → `ombrebrain/storage/vault_health.py`
 - [x] `backup_archive.py` → `ombrebrain/storage/backup_archive.py`（旧路径使用模块别名以保留 monkeypatch 语义）
-- [ ] `embedding_outbox.py`
+- [x] `embedding_outbox.py` → `ombrebrain/storage/embedding_outbox.py`
 - [ ] `projection_*` 与 `ledger_*`（每个文件仍单独迁移）
 
 ### 阶段 C：引擎与大型有状态模块

@@ -116,3 +116,11 @@ def test_backup_archive_legacy_import_is_the_canonical_module():
     assert legacy is backup_archive
     assert legacy.BackupArchiveError is backup_archive.BackupArchiveError
     assert legacy.build_export_archive is backup_archive.build_export_archive
+
+
+def test_embedding_outbox_legacy_imports_are_canonical_objects():
+    import embedding_outbox as legacy
+    from ombrebrain.storage import embedding_outbox
+
+    assert legacy.EmbeddingOutbox is embedding_outbox.EmbeddingOutbox
+    assert legacy.content_hash is embedding_outbox.content_hash

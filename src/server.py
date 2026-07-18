@@ -46,7 +46,7 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
-from embedding_outbox import EmbeddingOutbox
+from ombrebrain.storage.embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
 from migrate_engine import MigrateEngine
 from utils import get_version, load_config, setup_logging
