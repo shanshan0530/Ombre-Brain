@@ -309,7 +309,7 @@
     position: fixed;
     right: 12px;
     top: 12px;
-    width: 440px;
+    width: min(440px, calc(100vw - 24px));
     height: calc(100vh - 24px);
     background: var(--surface-solid);
     border: none;
@@ -451,43 +451,6 @@
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-glow), inset 2px 2px 4px var(--shadow-dark-subtle);
-  }
-
-  /* 日期「按钮」：一个拟态化凸起的 <button>，点它由 JS 唤起原生日期选择器。
-     里面藏一个 <input type="date"> 只用来存值（id=letter-date，sendLetter 读它），
-     不负责点击，也不显示任何原生控件——彻底告别小图标重叠。
-     按钮上的文字由 #letter-date-label 显示「请选择日期」或已选日期。 */
-  .config-row button.date-pill {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    box-sizing: border-box;
-    height: 39px;
-    padding: 0 14px;
-    border: none;
-    border-radius: 8px;
-    cursor: pointer;
-    font-family: inherit;
-    font-size: 13px;
-    text-align: left;
-    color: var(--text);
-    background: var(--bg);
-    box-shadow: 4px 4px 8px var(--shadow-dark-subtle), -4px -4px 8px var(--shadow-light);
-    transition: all 0.2s ease;
-  }
-  .config-row button.date-pill:hover {
-    box-shadow: 5px 5px 10px var(--shadow-dark), -5px -5px 10px var(--shadow-light);
-  }
-  .config-row button.date-pill:active {
-    box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
-  }
-  .config-row button.date-pill:focus-visible {
-    outline: none;
-    box-shadow: 0 0 0 3px var(--accent-glow), 4px 4px 8px var(--shadow-dark-subtle), -4px -4px 8px var(--shadow-light);
-  }
-  #letter-date-label {
-    pointer-events: none;
-    color: var(--text-dim);
   }
 
   .btn-primary {
@@ -804,7 +767,6 @@
     .bucket-row { padding: 12px 14px; gap: 4px; }
     .bucket-row-tags { display: none; }
     .bucket-row .time { display: none; }
-    .detail-panel { width: calc(100vw - 16px); right: 8px; top: 8px; height: calc(100vh - 16px); }
 
     /* ── Settings forms ── */
     .config-row, .form-row { flex-wrap: wrap; }
@@ -1698,7 +1660,7 @@
     position: fixed;
     right: 0;
     top: 0;
-    width: 460px;
+    width: min(460px, calc(100vw - 16px));
     height: 100vh;
     background: var(--surface-solid);
     z-index: 300;
@@ -1749,6 +1711,7 @@
     justify-content: center;
     transition: all 0.18s;
     flex-shrink: 0;
+    margin-left: auto;
   }
   .self-panel-close:hover { background: var(--accent-glow); color: var(--accent); }
 
@@ -2233,11 +2196,7 @@
           <option value="ai">AI</option>
         </select>
         <input type="text" id="letter-username" placeholder="署名 name（可选）" />
-        <button type="button" class="date-pill" style="flex:0 0 180px;" onclick="openDatePicker()">
-          <span id="letter-date-label">请选择日期 / Pick a date</span>
-          <input type="date" id="letter-date" onchange="syncDateLabel()" oninput="syncDateLabel()"
-                 style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;left:14px;bottom:0;" />
-        </button>
+        <input type="date" id="letter-date" style="flex:0 0 180px;" />
       </div>
       <div class="config-row">
         <label>标题 <span class="en">Title</span></label>
@@ -9008,26 +8967,6 @@ function _renderLetter(l) {
       <button data-letter-id="${escAttr(l.id)}" onclick="deleteLetter(this.dataset.letterId)" title="删除" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:13px;height:13px;"></i></button>
     </div>
   </article>`;
-}
-
-// 日期「按钮」：点按钮 → 主动唤起浏览器原生日期选择器。
-// showPicker() 是专门干这事的 API（Chrome/Edge/Safari 支持）；
-// 不支持时退回 focus+click，再不行就让隐藏 input 临时可见聚焦。
-function openDatePicker() {
-  const inp = document.getElementById('letter-date');
-  if (!inp) return;
-  try {
-    if (typeof inp.showPicker === 'function') { inp.showPicker(); return; }
-  } catch (e) { /* 某些浏览器在非用户手势下会抛错，下面兜底 */ }
-  inp.focus();
-  inp.click();
-}
-
-// 选完日期后，把按钮上的文字更新成所选日期（没选则回到提示）。
-function syncDateLabel() {
-  const inp = document.getElementById('letter-date');
-  const lbl = document.getElementById('letter-date-label');
-  if (inp && lbl) lbl.textContent = inp.value || '请选择日期 / Pick a date';
 }
 
 async function sendLetter() {
