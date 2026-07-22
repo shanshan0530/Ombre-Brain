@@ -27,3 +27,19 @@ def test_dashboard_hot_update_surfaces_csrf_proxy_guidance():
     assert "failure.error === 'Cross-origin request rejected'" in block
     assert "这不是 CORS 缺失" in block
     assert "OMBRE_TRUSTED_PROXY_CIDRS" in block
+
+
+def test_dashboard_has_dedicated_faq_tab_and_view():
+    html = (ROOT / "frontend" / "dashboard.html").read_text(encoding="utf-8")
+    faq_view = html[html.index('id="faq-view"') : html.index('<!-- Logs Tab View')]
+    logs_view = html[html.index('id="logs-view"') : html.index('<!-- Settings Tab View -->')]
+
+    faq_url = "https://docs.qq.com/doc/DRHp6UW9oYmd3QW5Z"
+    assert 'data-tab="faq"' in html
+    assert '<span class="tab-en">FAQ</span>' in html
+    assert 'id="faq-section"' in faq_view
+    assert faq_url in faq_view
+    assert 'target="_blank"' in faq_view
+    assert 'rel="noopener noreferrer"' in faq_view
+    assert 'id="faq-section"' not in logs_view
+    assert "getElementById('faq-view').style.display = target === 'faq'" in html

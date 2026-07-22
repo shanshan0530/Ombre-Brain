@@ -49,21 +49,16 @@ from typing import Any, Optional
 
 import frontmatter
 
+from ombrebrain.storage.backup_archive import (
+    BackupArchiveError,
+    extract_backup_archive_file,
+    validate_sqlite_bytes,
+    validate_sqlite_file,
+)
+
 try:
-    from backup_archive import (  # type: ignore
-        BackupArchiveError,
-        extract_backup_archive_file,
-        validate_sqlite_bytes,
-        validate_sqlite_file,
-    )
     from utils import _win_long_path, now_iso, safe_path, sanitize_name  # type: ignore
 except ImportError:  # pragma: no cover
-    from .backup_archive import (  # type: ignore
-        BackupArchiveError,
-        extract_backup_archive_file,
-        validate_sqlite_bytes,
-        validate_sqlite_file,
-    )
     from .utils import _win_long_path, now_iso, safe_path, sanitize_name  # type: ignore
 
 logger = logging.getLogger("ombre_brain.migrate")

@@ -10,7 +10,7 @@ import urllib.parse
 
 import pytest
 
-from public_origin import (
+from ombrebrain.security.public_origin import (
     configured_public_origin,
     normalize_http_resource,
     normalize_public_origin,

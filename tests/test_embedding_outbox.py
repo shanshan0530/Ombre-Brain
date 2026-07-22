@@ -9,7 +9,7 @@ import pytest
 
 from bucket_manager import BucketManager
 from embedding_engine import EmbeddingEngine
-from embedding_outbox import EmbeddingOutbox, content_hash
+from ombrebrain.storage.embedding_outbox import EmbeddingOutbox, content_hash
 from tools import _common as common
 from tools import _runtime as rt
 from web import embedding as embedding_web

@@ -16,7 +16,7 @@ from contextlib import AsyncExitStack
 from starlette.requests import Request
 from starlette.responses import Response
 
-from memory_messages import resolved_hint
+from ombrebrain.domain.memory_messages import resolved_hint
 from . import _shared as sh
 
 logger = sh.logger

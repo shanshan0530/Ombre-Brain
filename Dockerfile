@@ -85,5 +85,3 @@ ENV OMBRE_EMBED_BACKEND=api
 EXPOSE 8000
 
 ENTRYPOINT ["./entrypoint.sh"]
-
-# Zeabur rebuild trigger 2026-07-18 for Ombre Brain 2.7.7

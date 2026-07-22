@@ -2,6 +2,95 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.8.4
+
+### 修复 / Fixed
+
+- 修复 `digested=1` 只改变字段却仍会出现在无参 `breath()` 的问题：spontaneous/dream 策略现在硬过滤已消化桶，不再受 importance、pinned 或 3% 偶遇影响；带 query 的真实命中、importance 审计和 catalog 目录仍可显式找回。查询结果不足时追加的“非检索命中”随机漂浮也改用 spontaneous 策略，不再旁带 digested、dont_surface 或 anchor 桶。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.4`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.3
+
+### 修复 / Fixed
+
+- 修复"我 / Self"面板（dashboard.html 左下角 `I` 按钮）在窄屏设备上宽度固定溢出屏幕、显示不全的问题；连带把详情侧滑面板与自我面板的宽度都改成 `min(定宽, calc(100vw - 边距))` 自适应公式，替换掉原来"基础规则写死宽度 + 单独一条 `@media` 补丁"的模式，避免同类遗漏再次出现。
+- 修复"我 / Self"面板关闭按钮未贴靠面板右边缘的问题。
+- 修复手机端「写一封信」日期选择器点不开：原实现把真实 `<input type="date">` 藏成 1px 透明元素，靠 JS 调 `showPicker()`/`click()` 唤起原生选择器，但 iOS Safari 等移动浏览器只认落在控件本体上的真实点击，程序模拟点击不生效；现在改为直接展示原生日期输入框，任何设备直接点选。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.3`。
+
+## 2.8.2
+
+### 修复 / Fixed
+
+- 修复 Zeabur 等跨域部署在 Streamable HTTP + 静态 Token 鉴权下无法连接 `/mcp`：浏览器的 `OPTIONS /mcp` 预检现在显式跳过 MCP 鉴权，CORS 中间件调整到鉴权外层，预检不再返回无 CORS 响应头的 401；鉴权失败响应也会携带正确的 CORS 响应头，Polaris 网页版和桌面版可正常发起后续带 Token 请求。
+
+### 维护 / Maintenance
+
+- 完成 2.7.8 启动、跨越 2.7.8—2.7.10 三个正式版本的首批 `src/` 扁平模块兼容观察期：经生产引用、测试、活动文档与部署入口审计后，移除 memory/plan/provider/public-origin/scoring、storage/deployment、ledger/projection 共 16 个顶层兼容壳；仓库测试全部切换到 `ombrebrain.*` canonical package，避免内部代码继续延长旧路径生命周期。
+- 修正内部资料忽略边界：`docs/superpowers/`、代码健康审计、内部 TODO 与旧版发布草稿不再受 Git 跟踪，并补入 `.gitignore`；运行时覆盖矩阵不再发布内部计划文件路径。
+
+### 测试 / Tests
+
+- 新增鉴权中间件预检放行与完整 Streamable HTTP 中间件栈回归，覆盖静态 Token 模式下 `OPTIONS /mcp` 返回 200、允许 `POST` 及 `Authorization`/`Content-Type` 请求头。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.2`。
+
+## 2.8.0
+
+### 修复 / Fixed
+
+- 保留 `hold` 与 `grow(items=...)` 的自动合并能力，同时在相似候选之后增加保守的“同一具体事件”判定；仅主题、人物或情绪相似，日期、场景或关键动作不同的独立事件不再串入旧桶，完全相同正文继续保持幂等。
+- 修复 `breath_advanced(catalog=True)` 忽略 `tags` 与 `max_results`：目录模式现在执行 tags AND 过滤并遵守返回上限，仍保持 0 LLM、只读元数据。
+- `breath_search` 与 `breath_advanced` 新增 `date_from/date_to` 创建日期过滤，支持 `YYYY-MM-DD` 与 ISO 8601；自由联想也受同一日期范围约束，避免按日期检索时漂出范围外旧桶。
+- 为语义检索补充不记录查询原文的诊断日志，包含查询哈希、向量候选与得分、embedding 引擎和耐久 outbox 状态，便于区分索引未更新、服务不可用和排序结果问题。
+- OAuth 授权页增加提交中状态、重复提交保护、30 秒超时提示与诊断编号；服务端按同一编号记录提交、密码失败和跳转阶段，便于定位授权页面卡住。
+
+### 行为说明 / Behavior
+
+- 保留检索命中不足时浮现 3–5 条低权重旧记忆的自由联想设计，并以“非检索命中”独立分区明确标记。
+- 保留核心准则无条件注入设计；传入 tags 时会明确说明 tags 只过滤普通浮现记忆。
+
+### 部署 / Deployment
+
+- 新建并验证 Zeabur 一键部署模板 `WB5ZKE`，README 部署按钮已指向新模板，同时保留 Deploy from GitHub 备用流程。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.0`。
+
+## 2.7.9
+
+### 修复 / Fixed
+
+- 修复 `grow` 长内容拆分所用的 digest prompt 未注入第一人称视角铁律：现在与 dehydrate/merge 共用同一规则，AI 自身保持“我”，人类一方保持配置名称，并禁止动作或情绪主语翻转（#62）。
+
+### 文档 / Documentation
+
+- 补清 Zeabur/Render 反代后的 OAuth 公网来源配置：标准 `X-Forwarded-Proto` / `X-Forwarded-Host` 已受支持，但只采信可信最后一跳；托管平台应在安全部署向导填写 HTTPS 公网地址，避免 OAuth 元数据回落为容器内部 `http://`，同时禁止用 `0.0.0.0/0` 放宽代理信任（#63）。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.9`。
+
+## 2.7.8
+
+### 维护 / Maintenance
+
+- 渐进整理 `src/` 根目录：将领域消息、计划历史、服务商识别、公开来源校验、部署模式、检索评分、媒体与备份存储、embedding outbox、ledger 及 projection 实现迁入 `ombrebrain/` 对应领域包；仓库内生产代码改用新的 canonical package 路径。
+- 旧的顶层 Python 导入路径暂时保留为轻量兼容壳。本版本开始计算三个正式版本的弃用观察期：`2.7.8`、`2.7.9`、`2.7.10` 保持兼容；最早在 `2.7.11` 经引用、文档、部署和完整回归审计后删除，不能仅按版本号自动移除。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.8`。
+
 ## 2.7.7
 
 ### 修复 / Fixed
