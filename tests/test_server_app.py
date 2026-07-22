@@ -703,6 +703,29 @@ async def test_auth_middleware_can_be_explicitly_disabled():
     assert downstream.scopes == [scope]
 
 
+@pytest.mark.asyncio
+async def test_auth_middleware_skips_mcp_cors_preflight():
+    downstream = RecordingASGIApp()
+    middleware = MCPAuthMiddleware(
+        downstream,
+        auth_required=True,
+        token_validator=lambda *_args, **_kwargs: pytest.fail(
+            "CORS preflight must not be authenticated"
+        ),
+        auth_mode="token",
+    )
+    scope = {
+        "type": "http",
+        "method": "OPTIONS",
+        "path": "/mcp",
+        "headers": [(b"origin", b"https://polaris.example")],
+    }
+
+    await middleware(scope, _empty_receive, _discard_send)
+
+    assert downstream.scopes == [scope]
+
+
 class RecordingService:
     def __init__(self, name, events):
         self.name = name
@@ -884,8 +907,60 @@ def test_build_http_app_uses_same_managed_stack_for_both_http_transports(transpo
         if item.cls is OriginCSRFGuardMiddleware
     )
     assert csrf_middleware.kwargs["public_origin"] == "https://public.example"
+    middleware_order = [item.cls.__name__ for item in app.user_middleware]
+    assert middleware_order.index("CORSMiddleware") < middleware_order.index(
+        "MCPAuthMiddleware"
+    )
     assert app.state.ombre_http_settings is settings
     assert app.state.ombre_runtime_lifecycle is lifecycle
+
+
+@pytest.mark.asyncio
+async def test_build_http_app_answers_mcp_preflight_before_token_auth():
+    class FakeMCP:
+        def streamable_http_app(self):
+            return Starlette()
+
+    app = build_http_app(
+        FakeMCP(),
+        "streamable-http",
+        settings=HTTPRuntimeSettings(
+            auth_required=True,
+            max_request_bytes=2048,
+            auth_mode="token",
+        ),
+        token_validator=lambda *_args, **_kwargs: pytest.fail(
+            "CORS preflight must not be authenticated"
+        ),
+        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
+    )
+    messages = []
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "scheme": "https",
+        "method": "OPTIONS",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "server": ("ombre.example", 443),
+        "client": ("127.0.0.1", 50000),
+        "headers": [
+            (b"host", b"ombre.example"),
+            (b"origin", b"https://polaris.example"),
+            (b"access-control-request-method", b"POST"),
+            (b"access-control-request-headers", b"authorization,content-type"),
+        ],
+    }
+
+    await app(scope, _empty_receive, _collect_into(messages))
+
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert start["status"] == 200
+    assert headers[b"access-control-allow-origin"] == b"*"
+    assert b"POST" in headers[b"access-control-allow-methods"]
+    assert b"authorization" in headers[b"access-control-allow-headers"].lower()
 
 
 def test_build_http_app_rejects_stdio_transport():

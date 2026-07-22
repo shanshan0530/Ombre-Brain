@@ -42,7 +42,7 @@ EXPECTED_TOOLS = {
 
 EXPECTED_TOOL_PROPERTIES = {
     "breath": set(),
-    "breath_search": {"query", "domain", "max_results"},
+    "breath_search": {"query", "domain", "max_results", "date_from", "date_to"},
     "breath_advanced": {
         "query",
         "max_tokens",
@@ -53,6 +53,8 @@ EXPECTED_TOOL_PROPERTIES = {
         "importance_min",
         "tags",
         "catalog",
+        "date_from",
+        "date_to",
     },
     "hold": {
         "content",
@@ -92,6 +94,7 @@ EXPECTED_TOOL_PROPERTIES = {
         "media_replace",
         "hard_delete",
         "delete_reason",
+        "restore",
         "old_str",
         "new_str",
     },
