@@ -2,6 +2,722 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.16.2
+
+### 新增 / Added
+
+- Dashboard「热更新」面板新增「热更新遇到依赖变化时自动安装」开关，等效于设置
+  `OMBRE_UPDATE_ALLOW_PIP=1`（写 `config.yaml` 的 `update.allow_pip_install`，
+  立即生效不需要重启）。此前这个能力只存在于代码和环境变量里，只能 SSH 改
+  `.env` 重启才能碰到；这次改动只是把已有开关暴露成能点的 UI，**默认值没有
+  变**——安全加固 #2（自动 pip 会把"谁能点热更新"放大成任意 PyPI 包的执行面）
+  仍然默认关闭，需要部署者自己清醒地打开。
+
+### 修复 / Fixed
+
+- 热更新遇到「依赖清单变化 + 自动 pip 关闭」时，检查提前到下载/解析完更新包
+  之后、真正备份 `_prev` 和覆盖 `src/`、`frontend/` 之前。此前会先建回滚点、
+  写完文件才发现装不了依赖，再整体回滚——多做一轮磁盘 I/O，报错文案也不准确
+  （"已回滚"，其实这次没有任何文件被改动过）。现在直接在写文件前拒绝，报错
+  也改成「未改动任何文件」，并在文案里指向新加的 Dashboard 开关。
+
+### 测试 / Tests
+
+- 新增 `test_update_settings_endpoint_persists_and_takes_effect_immediately`、
+  `test_update_settings_endpoint_rejects_missing_field`。
+- `test_changed_release_lock_with_pip_disabled_rolls_back_everything` 更名为
+  `..._rejects_before_touching_disk`，补充断言确认 `_prev` 回滚点全程没有被
+  创建过。
+
+### 文档 / Docs
+
+- `docs/ENVIRONMENT_VARIABLES.md`、`docs/OPERATIONS.md` 说明 `OMBRE_UPDATE_ALLOW_PIP`
+  与新 Dashboard 开关是同一件事的两种配置方式，以及"提前拒绝"这个行为变化。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.16.2`。
+
+## 2.16.1
+
+### 修复 / Fixed
+
+- 云服务器/远程部署首次打开 Dashboard 设置密码时，`/auth/setup` 一直是"仅本机可
+  设置"（防止部署窗口期被人抢先设成他人的密码），但页面不会提前说明，用户填完
+  密码点提交才被拒绝，报错还是英文原文，体验上跟 `rule.md` 第 6 条"安全复杂性
+  应由系统承担，不能转嫁给用户"正好相反。
+- 首次设置表单现在会在检测到当前不是从 `localhost`/`127.0.0.1` 访问时提前显示
+  中文提示，说明要去服务器上设 `OMBRE_DASHBOARD_PASSWORD` 或 `OMBRE_SETUP_TOKEN`；
+  即便这个前端启发式判断漏判，提交失败后的报错也会换成同样的中文说明（真正生效
+  的判定仍在服务端 `web/auth.py` 的 `_setup_request_allowed`，前端只是提前预警）。
+- 新增环境变量 `OMBRE_SETUP_TOKEN` 的文档（此前只存在于代码里，`docs/ENVIRONMENT_VARIABLES.md`
+  和 README 都没提，普通用户无从得知这条远程补救路径）。
+
+### 测试 / Tests
+
+- 新增 `test_setup_form_warns_only_when_not_on_a_loopback_host`、
+  `test_setup_failure_explains_the_local_only_restriction`。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.16.1`。
+
+## 2.16.0
+
+### 新增 / Added
+
+- 转换历史 Letter（`convert_to_lockable`）在 `AI_NAME` 未配置、拿不到"实际关系名"
+  时不再只是报错终止：Dashboard 弹窗当场填一个名字即可重试完成这一次转换，仅
+  作用于这一次请求，不写入全局配置。后端 `/api/letter/{id}` PATCH 新增可选
+  `ai_name` 字段，取值仍要经过 `_is_actual_relation_name` 校验——"ai" / "assistant"
+  等通用占位依旧会被拒绝，这道准入门槛本身没有削弱。
+
+### 测试 / Tests
+
+- 新增 `test_historical_conversion_accepts_request_scoped_ai_name_override`：
+  验证 `AI_NAME` 未配置时请求体传入实际关系名可以完成转换，且传通用占位名
+  仍会被拒绝。
+- 更新 `test_dashboard_offers_one_way_legacy_letter_conversion_to_ai_ownership`
+  匹配新的请求体构造方式与弹窗文案。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.16.0`。
+
+## 2.15.0
+
+### 安全 / Security
+
+- 修复 `cryptography==49.0.0` 的已知漏洞 PYSEC-2026-3552（无同版本修复，只能升级到
+  `50.0.0`）。CI 的 `pip-audit` 检查自 2026-08-04 起持续报红：`.github/workflows/tests.yml`
+  锁文件校验固定的包索引快照日期（`UV_EXCLUDE_NEWER`）早于 `cryptography 50.0.0`
+  发布日（2026-07-31），锁文件永远重新解析回 `49.0.0`。快照推进到 `2026-08-01`，
+  重新生成 `requirements.lock.txt` / `requirements-dev.lock.txt`。
+
+### 破坏性变更 / Breaking
+
+- 移除 legacy SSE MCP 传输（`transport: sse`，`/sse` `/messages` 路由）。现在只支持
+  `stdio` 与 `streamable-http`；已废弃客户端请改连 `/mcp`。Dashboard「传输模式」
+  与首次部署向导的 `sse` 选项一并移除。未识别的 `transport` 取值（含 `sse`）现在
+  会在启动期显式报错退出，不会再落到 FastMCP 自带、不受本项目鉴权/CORS/CSRF/
+  限流中间件保护的 `mcp.run(transport="sse")`。
+- 上面的快照推进连带把 `mcp` 1.28.1→1.29.0、`openai` 2.45.0→2.52.0、`uvicorn`
+  0.51.0→0.52.0 等包一起升级，`requirements.lock.txt` 内容随之改变。仍在运行
+  v2.8.4 之前旧逻辑、且这次之前从未升级过的部署实例，热更新时可能无法再走旧的
+  legacy 依赖回退路径，需要手动升级一次；这是经过评估后接受的破坏性变更，不再
+  为其设计兼容迁移。
+
+### 测试 / Tests
+
+- `tests/test_server_app.py`：移除依赖 legacy SSE 官方客户端连接的回归，改为验证
+  `build_http_app` 对 `"sse"` 显式抛错。
+- `tests/test_secure_onboarding.py`：网络传输安全矩阵不再覆盖 `sse`；用 `stdio`
+  替换测试里原本用 `sse` 占位的「已保存但未生效」示例值。
+- `tests/test_update_source_gate.py`：`requirements.lock.txt` 基线哈希推进到新内容，
+  说明这次是经评估后接受的破坏性变更。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.15.0`。
+
+## 2.14.2
+
+### 修复 / Fixed
+
+- 热更新重启等待提示改为原地刷新省略号（1～3 个循环），不再每 2 秒追加一行「等待
+  服务恢复…」。原逻辑在服务端 `os.execv` 自重启期间轮询 `/api/version`，最长 60 秒
+  内会连续刷出 30 行日志、日志框不停向下滚动，服务其实已正常恢复，只是这段等待
+  体验容易让人误以为卡死。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.14.2`。
+
+## 2.14.0
+
+### 新增 / Added
+
+- Letter 支持 `none`、`timed`、`permanent` 三种锁状态；新增只修改锁元数据的
+  `letter_lock_update`，锁所有权只由 Dashboard/MCP/stdio 等可信入口确定，署名不参与权限。
+- Dashboard 可创建、查看和管理自己的锁信；对方尚未开放的信只显示实际关系名、时间与锁状态，标题和正文不返回。
+- SessionStart 按 hook Token、Dashboard session 或公开未认证入口采用对应可见性；锁提示只使用已有实际关系名。
+- Letter 语义检索在向量反序列化和相似度排序前排除当前不可见候选，避免查询命中本身泄露内容。
+
+### 兼容与边界 / Compatibility & Boundary
+
+- 历史 Letter 缺少锁字段时按无锁处理，不迁移数据；旧调用不传锁参数时行为不变。
+- 不新增必填环境变量，不修改 OAuth、Token、Docker Compose 或 multi-owner 配置。
+- 时间锁是应用层关系边界，不是磁盘加密；拥有 vault 或宿主机文件权限的人仍能读取 Markdown 原文。
+- 保留 Dashboard 原有 Letter 原稿编辑：历史/无锁 Letter 和锁拥有者自己的锁信可编辑；原稿编辑与锁管理必须分开请求，来信方未解锁内容不可读写，编辑后正常刷新搜索索引。
+- 历史公开 Letter 可在 Dashboard 按需转换为新版格式；转换不改原稿、不根据 `author` 推断身份，锁控制权固定交给当前 AI，并补写现有配置中的实际 AI 关系名。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.14.0`。
+
+## 2.13.1
+
+### 修复 / Fixed
+
+- 修复热更新因完整性清单不符而整包中止：`update_manifest.json` 首次入库时是在
+  Windows 工作区生成的，记录的是 CRLF 字节，而 GitHub 源码归档携带的是仓库里的
+  内容，206 个文件里有 170 个大小/哈希对不上，更新在 `frontend/onboarding.html`
+  处中止（清单记 10819 字节，归档里是 10621）。
+- `deploy/gen_update_manifest.py` 改为直接读 Git 仓库存储字节（优先 index，回退
+  HEAD）生成清单，不再读工作区，也不用「文本一律归一为 LF」的启发式——本仓库
+  index 里有 9 个文件存的就是 CRLF、30 个是混合行尾，归一化会把这 39 个反向算错。
+  文件不在 index 也不在 HEAD 时直接报错，不再拿工作区字节顶替。
+- 发布顺序固定为：先 `git add` 代码改动，再生成清单——清单描述的是仓库内容，
+  不是磁盘内容。
+- 修复 STDIO transport 成功启动后 `.boot_fails` 未重置：HTTP/SSE 通过
+  `RuntimeLifecycle` 在成功启动后清零，STDIO 原先直接调用 `mcp.run()` 缺少对应
+  lifecycle；现改为在 FastMCP public lifespan 成功进入时复用现有 boot marker reset 语义。
+
+### 测试 / Tests
+
+- 新增 `tests/test_update_manifest_repo_bytes.py`：用临时 git 仓库复现
+  「index 存 LF / 工作区 CRLF」与「index 存 CRLF」两种会被算错的形态，
+  并校验仓库现有清单与 HEAD 字节逐条一致。
+- 新增真实 STDIO MCP 子进程回归：完成 `initialize` 与 `tools/list`（15 个工具）后，
+  验证 `.boot_fails` 从 1 重置为 0。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.13.1`。
+
+## 2.13.0
+
+### 新增 / Added
+
+- `I` 改成沉淀机制：写下的「我觉得……」不再直接成为自我认知，而是先落成一条普通 `dynamic` 记忆（候选），跟别的记忆一样浮现、衰减、进 dream；站不住的自然沉下去。
+- `dream` 新增待沉淀候选段：列出每条候选、已被几次 dream 见证，并附本次语义上撞上的材料——已认下的自我认知、普通记忆、另一个还没沉淀的念头都可能出现。碰撞只摆材料，不判断谁支持谁、谁与谁矛盾。向量索引不可用时照样列候选，并明说这次没有材料对照。
+- `I(promote="桶ID")` 升级候选为正式条目，门槛是被 **3 个不同日期**的 dream 见证过；不够时明确回报还差几次。可同时传 `content` 用提炼后的措辞落成正式条目。
+- `I(read=True)` 同时列出待沉淀候选，并把早期直接写入的历史条目标注为「未经沉淀」。
+
+### 边界 / Boundaries
+
+- 见证只认真的被渲染进 dream 输出的候选；因 token 预算未展开的候选不计次数。同一天做多次 dream 只算一次见证。
+- 升级不删除候选桶（rule.md 第 1 条），候选保留原文并标记 `i_stage: promoted` 与指向正式条目的 `i_promoted_to`。
+- 候选带 `__i_candidate__` 标签而非 `__i__`，不会被 SessionStart 注入或 Dashboard `/api/self` 当成已成立的自我认知。
+- 待沉淀候选不能被 `hold` / `grow` 当作合并目标（与 pinned / protected 同一道准入）：它是「我对我自己的一个判断」而不是时间里发生的事，正文被追加改写会让「几轮梦之后它还站得住吗」失去判断对象。候选升级或退出候选状态后，合并路径恢复正常。
+- 不提供绕过候选阶段直写正式 `I` 的通道；哲学边界见 rule.md 第 13.1 条。
+
+### 测试 / Tests
+
+- 新增 `tests/test_i_sediment.py`：候选形态、见证计数按天去重、未渲染不计次、门槛拒绝与升级后候选留存、碰撞材料呈现、向量不可用降级、早期条目标注。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.13.0`。
+
+## 2.12.1
+
+### 修复 / Fixed
+
+- 解钉现在必须在同一次 LLM `trace` 或 Dashboard 请求中明确给出 `importance=1..10`，并原子落盘为动态桶；不再让解除核心后的记忆沿用 999 分短路或依赖第二次补写。
+- 新记忆统一声明 `source_tool`，内部 append-only Footprint 记录创建来源以及钉选/解钉操作者（用户、LLM 或系统）；足迹供召回时的 LLM 判断，不新增 Dashboard 编辑入口，也不替代桶与 ledger 真源。
+- 标准记忆 JSON（`name/content/domain/valence/arousal/tags/importance`）改为确定性直导，不再先发 LLM 请求；预检明确显示 0 次 API 调用，逐项校验失败会指出条目与原因，无 LLM 配置时也可导入。
+
+### 测试 / Tests
+
+- 增加 Footprint 来源与操作者、LLM/Dashboard 解钉原子 importance、结构化 JSON 离线直导、无 LLM 预检及逐项错误反馈回归。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.12.1`。
+
+## 2.12.0
+
+### 新增 / Added
+
+- 新增开发侧离线 `HN-F1` 候选工具：以严格枚举元数据执行 PAS10 计数档位归一化，并用纯整数 Pareto-DP 对 PAS12 的 `P0/M1/Rtech` 粗分区给出可复核的精确可行、精确不可行或资源不确定结果。
+- 新增候选机器合同、输入成员集合绑定、实现与 schema 哈希绑定、独立 witness 复核，以及 `aggregate-last.v1` 两文件逻辑提交协议。aggregate 仅在最后发布；缺少 aggregate 或两文件结构、共同字段、场景投影、私有运行记录哈希不一致时，不得把结果视为已提交 receipt。
+
+### 安全与边界 / Security & Boundaries
+
+- 除读取自身实现两次以核对运行前后完整性外，工具的业务输入只来自由外部管理员事前建立并证明 ACL／单写者边界的受限目录中的无正文枚举 JSON；它不读取 OB 配置、环境变量、真实 vault、模型输出或网络资源。代码内的路径与文件模式检查只是事故防护，不证明现实 ACL、owner、不可变性或跨文件事务。源码位于 Docker 构建上下文排除的 `tools/`，不新增 MCP、Dashboard 或线上运行入口。
+- 当前实现只是未冻结的 PAS10 候选归一化器与 PAS12 候选数学核，不计算 PAS01–PAS14 治理状态，不执行 donor 联系、真实数据实验、PAS13 公开投影或 PAS14 授权。正式 PAS 哈希与批准状态不能由候选输出替代。
+- `max_seconds` 是归一化与 LB/UB 共用的协作式单调时钟预算；检查到超时只返回资源错误与数学不确定。它不是硬 wall-clock 隔离，正式运行仍需外部 watchdog、内存/CPU 限制与冻结的恢复规则。
+
+### 测试 / Tests
+
+- 增加计数档位、nonresponse、资格/处置、frame/implementation/schema 绑定、严格 JSON、输出 pair 一致性、CLI 泄漏与受限路径回归。
+- 增加独立 `4^N` 小规格穷举对照、固定 44 人边界、M1 cap、零目标、Pareto 剪枝、早停、witness 篡改与资源上限 fail-closed 回归。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.12.0`。
+
+## 2.11.1
+
+### 修复 / Fixed
+
+- 修复云部署明确设置 `mcp_require_auth: false` 后，启动期网络门禁仍在内存中强制开启鉴权，导致 `/mcp` 返回 401、CC 云 session 报 `MCP error 32003` 的问题。网络边界风险仍会进入诊断与告警，但不再覆盖用户明确选择的 MCP 鉴权开关。
+- Dashboard 将只读综合计算值由“权重分 / Weight”改称“活跃度分 / Activity score”，明确它由 importance、时间、激活次数、唤醒度和解决状态共同计算；`importance` 仍可编辑，综合分不新增人工或模型覆盖入口。
+
+### 测试 / Tests
+
+- 增加非回环云环境下免鉴权配置保持生效的回归，覆盖运行配置、MCP 中间件和 OAuth 路由使用同一关闭鉴权快照。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.11.1`。
+
+## 2.11.0
+
+### 新增 / Added
+
+- 新增独立的 `bucket_edges` SQLite 表定义，只包含来源桶、目标桶、创建时间、最近激活时间、
+  激活次数和派生权重六个字段；不接入采集、衰减、剪枝、检索或关系分类。
+
+### 测试 / Tests
+
+- 增加边表字段白名单、幂等初始化、非破坏性和基础约束回归。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.11.0`。
+
+## 2.10.2
+
+### 修复 / Fixed
+
+- 修复 nginx 等反向代理返回 HTML、空响应或网关错误时，Dashboard 登录页把所有非 JSON 响应误报为“密码错误”的问题。登录页现在保留 OB 返回的明确错误，并分别提示来源校验失败、代理响应异常和网络不可达。
+- 密码验证成功后先通过 `/auth/status` 确认浏览器已保存并回传 `ombre_session`，确认成立后才初始化 Dashboard；若 `Secure`、Host、协议或 `Set-Cookie` 转发导致会话未建立，会停留在登录页并给出对应检查项。
+- 登录请求显式使用同源凭据与禁缓存语义；不会新增 localhost 免密，也不会自动信任 Docker 私网或放宽 `OMBRE_TRUSTED_PROXY_CIDRS`。
+
+### 测试 / Tests
+
+- 增加 Docker 网关来源、可信转发头与环境变量密码的完整登录成功回归，并覆盖非 JSON nginx 错误不再伪装成密码错误、成功响应缺少有效 Cookie 会话时不进入 Dashboard。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.10.2`。
+
+## 2.10.1
+
+### 修复 / Fixed
+
+- 修复 v2.10.0 原文证据未进入本地完整备份与 GitHub 备份的问题。新备份会携带并校验 `sources/src_<sha256>.source`，GitHub 同步使用 `_sources/src_<sha256>.source`；导出前交叉检查全部引用，恢复时先验证/安装全部证据再写桶。旧备份仍可导入，但若桶引用的原文不在包内会明确警告，不再显示成无损恢复；Dashboard 会分别显示恢复的记忆数与安装的证据数。
+- 修复 `source_read(scope="event")` 遇到空 `source_ranges` 时可能退化为整份原文的问题。事件模式现在必须有有效整数行范围，布尔值、小数与数字字符串不会再被误转成行号；确需整份共享原文时必须显式使用 `scope="full_source"`，越界范围会拒绝而不是静默裁剪。
+- 修复长原文核对时先拼接全部证据、可能放大内存占用的问题。分页读取只保留当前窗口，输出头也计入 `max_tokens`，过长内容继续通过 `next_cursor` 分页，不静默超预算。
+- 加固原文证据的路径、符号链接、大小、UTF-8、内容哈希与并发发布校验；在不支持硬链接的 NAS/SMB/FUSE 文件系统上使用跨进程 sidecar 锁，避免不可变证据被并发覆盖。
+- 修复人工元数据仍可能被模型结果覆盖的问题。`hold` 与结构化 `grow` 现在让显式标题、标签、domain、importance 和情感坐标优先；未填写时才采用模型建议。结构化条目的未知字段、错误类型和越界值会在写入前明确拒绝。
+- 修复 Dashboard 只能改显示名、不能原子更新显式标题的问题。标题改名会在同一次桶写入中同步兼容显示名，并统一执行单行、120 字符上限且不静默截断。
+- 修复 Docker 构建中 `cloudflared` 下载失败可能被后续清理命令覆盖为成功退出码的问题；启用 Tunnel 组件时现在下载或授权失败会让构建明确失败，不再产出缺少二进制的假成功镜像。
+
+### 安全与兼容性 / Security & Compatibility
+
+- 精确桶 ID + 精确标题只是一次显式读取意图门禁，不是身份认证。远程可达的公网或局域网部署必须使用 OAuth/Token；stdio 与经安全门禁确认的本机回环模式继续遵循既有部署边界。`source_read` 会把原文标记为不可信存储数据，不调用模型、搜索或联想其他桶。
+- 原文证据从本版起随完整备份迁移；v2.10.0 已生成的旧备份可能不含证据文件，只能恢复事件正文和元数据。证据层仍不参与普通 Markdown 桶扫描、日常浮现或语义索引。
+- GitHub 备份与本地导出 ZIP 中的原文都是可读明文而非端到端加密内容；GitHub 应使用可信私有仓库并审计协作者权限，本地 ZIP 应加密保管或放入可信存储。
+- 新增原文证据边界 ADR，并补齐备份恢复、并发写入、恶意路径/控制字符、分页预算与人工元数据优先级回归。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.10.1`。
+
+## 2.10.0
+
+### 给合作者的版本说明（人话）
+
+这次主要解决两个体验问题：
+
+- **记忆标题可以由整理者拍板。** 以前即使正文第一行已经写了《wife》，打标模型仍可能概括成“直接确认关系”。现在 `hold` 和结构化 `grow` 都能直接传最终标题；人工给出的标题、标签和重要度优先，模型只补没填的部分。提示词也会优先保留原文里的《标题》、独立首行和关键原话，但没有提高模型温度，避免打标变得飘忽。
+- **增加一层平时隐藏、需要时才精确读取的原文。** 日常检索仍返回整理后的事件记忆。只有同时给出记忆桶 ID 和完全一致的标题时，`source_read` 才读取该桶对应的原文片段；它不做语义联想、不带出其他桶、不再次摘要。原文过长时明确分页，不静默截断。
+
+设计上，一条记忆分成三层：
+
+- **事件层**：日常 breath 使用的整理后正文，兼顾信息密度与可读性。
+- **元数据层**：标题、中文短标签、importance 和情感坐标，允许整理者最终拍板。
+- **证据层**：按内容哈希保存的不可变原文，默认不浮现，也不进入当前 Markdown GitHub 同步；只有精确核对时读取。
+
+这样既不会因为保存全部原文拖垮日常上下文，也不会因为反复压缩而彻底失去当时真正说过的话。
+
+### 新增 / Added
+
+- 新增隐藏的不可变原文证据层：`grow(content=原文, items=[...])` 将共享原文按 SHA-256 内容寻址保存一次，每个事件桶以 `source_ranges` 指向自己的行范围。原文默认不参与普通浮现、Markdown GitHub 同步或当前 Markdown 备份导出。
+- 新增第 15 个 MCP 工具 `source_read`。它必须同时精确命中桶 ID 和显式标题，一次只读取一个桶，不做语义搜索、相关桶扩散或模型处理；长原文通过 `next_cursor` 明示分页。
+- `hold` 新增显式 `title`；`grow(items)` 对象条目支持标题、标签、importance、domain、valence、arousal 与 source_ranges。显式元数据始终优先于打标模型。
+
+### 改进 / Changed
+
+- 脱水与打标提示词优先保留《标题》、独立首行标题和有辨识度的关键原话，避免“确认关系”“达成共识”等会议纪要式标题；模型温度保持不变。
+- 原文证据使用 `.source` 文件、写入时原子去重、读取时校验内容哈希；桶合并会追加来源引用而非覆盖已有证据。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.10.0`。
+
+## 2.9.0
+
+### 修复 / Fixed
+
+- 修复旧 Docker 实例仅靠热更新跨版本升级、当前持久代码目录与镜像基线都缺少 `requirements.lock.txt` 时，被误判为“依赖清单变化”并回滚的问题。只有“旧锁完全缺失”才会用离线、无安装的 pip dry-run 核对当前解释器是否已经满足新锁；已有旧锁但内容不同时仍保持严格拒绝。
+- 依赖自愈探测只接受固定版本与 SHA-256 hash，禁用索引、网络、依赖解析和缓存；URL、editable、全局 pip 选项、宽松版本、非法 UTF-8、超时或子进程失败均失败关闭，成功后同步正式锁文件供后续更新比较。
+- 修复长对话或纯文本作为单个超长 turn 时没有真正分块、随后在提取层静默截断尾部的问题。现在按 token 预算无损拆分，防御层遇到异常超限会显式报错而不会丢正文。
+- 修复历史导入按语义相似度合并旧桶，造成生成数量偏少、旧日期沿用和导入结果不可见的问题。对话导入现在只做全局精确内容幂等去重并新建独立桶，不再修改相似旧记忆。
+- 修复“已导入记忆”接口混入普通最新桶且固定只显示前 30 条的问题；接口仅返回导入桶并支持分页，Dashboard 可加载更多，导入完成或切回桶列表时会主动刷新。
+- 修复 Dashboard 顶栏响应式换行后，系统状态条仍使用固定偏移而遮住折叠入口和设置内容的问题；现在跟随顶栏实际高度动态定位。
+- 修复大量短消息因逐行 token 向下取整而生成超预算导入分块、随后被提取层整块拒绝的问题；任务状态会区分完成、部分完成与失败，早期失败也不再显示上一次任务结果。
+- 导入精确去重由“每条记忆重新扫描全库”改为“每个任务一次建立正文摘要集合并增量维护”，避免大库长对话产生 `O(导入条数 × 桶数)` 的重复磁盘解析。
+- “已导入记忆”加载更多改为只追加新卡片，不再反复销毁并重建已经显示的全部 DOM 节点。
+- Dashboard 热配置在模型运行时重建或 `config.yaml` 持久化失败时会恢复配置、压缩客户端和向量引擎的同一份快照，避免接口报错后出现“界面配置、内存配置、实际组件”部分生效的分裂状态。
+- 修复超深 JSON、平台无法表示的极端导出时间戳可使导入预检返回 500 的问题；异常输入现在安全降级或返回不含内部细节的 400。LLM 提取结果同时强制最多接收 5 条有效记忆，避免异常模型输出造成批量写入放大。
+
+### 新增 / Added
+
+- 新增 `hybrid` MCP 鉴权模式：OAuth 动态注册、授权码与访问 Token 流程继续可用，同时 `Authorization: Bearer` 也接受预置静态 Token；`Ombre-MCP-Token` 仍只接受静态 Token。Claude.ai 与只支持固定 Bearer 的客户端可安全共存。
+- Dashboard、YAML/env 配置、部署向导、系统诊断、Tunnel 提示和官方 Compose 模板同步支持 OAuth / Token / 共存三态。多 owner Compose 为每个实例使用独立静态 Token，避免跨实例凭据复用。
+- 对话导入桶持久化 `imported: true` 与 `source_tool: import`，Dashboard 列表、详情和复核卡片显示“被导入”；`created` 与 `last_active` 使用同一个实际导入时刻，不再采用历史对话时间。
+
+### 安全 / Security
+
+- 共存模式鉴权失败仍返回 OAuth resource metadata，静态 Token 比较使用固定长度摘要与恒定时间比较；纯 OAuth 不会意外接受残留静态密钥，OAuth access token 也不能通过静态自定义头。
+- 多实例部署不再把同一静态万能 Token 注入所有 owner；示例改用 `OMBRE_MING_MCP_TOKEN` / `OMBRE_HONG_MCP_TOKEN` 独立密钥。
+- `grow` 的外部模型调用失败只返回程序内置的安全提示；供应商异常正文不会进入 MCP 响应、持久错误或日志，避免密钥、URL 与请求内容泄露。
+- Dashboard 登录、远程初始化和 Hook Token 统一使用 UTF-8 摘要做恒定时间比较；非 ASCII 错误凭据现在正常拒绝，不再触发 `compare_digest` 类型异常和 500。OAuth 授权日志字段会移除控制字符，避免换行伪造审计记录。
+- 同内容与合并写入的跨进程锁改为内核文件租约，不再按 `mtime` 删除“过期”锁，避免两次慢模型调用超过阈值时第二进程抢占仍存活的临界区。
+- Dashboard 称呼拒绝控制字符，导入提取不再把称呼拼进 system prompt，而是放入明确标记为不可信的 JSON 数据记录。Hook Token 示例同步删除不安全且实现未支持的 URL 查询参数方式。
+
+### 测试 / Tests
+
+- 增加热更新无旧锁迁移、恶意依赖语法、OAuth/静态 Token 共存矩阵、多实例密钥隔离、超长单轮和大量短轮次的预算内无损重组、导入只新建、导入日期/来源标记、失败终态、结果筛选分页及 Dashboard 刷新的回归测试。
+- 增加活锁不可抢占、异常 JSON/时间戳、模型输出条数上限、称呼提示词边界和 Hook 凭据文档契约的红蓝对抗回归。
+- 完成全项目活代码盘点、静态质量与安全扫描；移除已被事务式会话持久化路径完全替代、且没有生产调用方的旧会话保存包装函数和对应测试残留。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.9.0`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.12
+
+### 安全 / Security
+
+- 修复本机模式在裸机默认监听 `0.0.0.0` 时仍关闭 MCP 鉴权、导致局域网设备可匿名调用全部记忆工具的问题。本机模式现在默认保留鉴权；第三方客户端与 NAS/局域网部署推荐使用静态 Token。
+- 新增统一网络边界门禁：网络 MCP 免鉴权只允许明确的 IPv4/IPv6 回环地址。旧配置处于非回环或 Docker 宿主绑定未知状态时，启动过程只在内存中强制开启鉴权，不改写配置、不阻止 Dashboard；部署向导与 Dashboard 保存接口同步拒绝危险组合。
+- 内置 Cloudflare Tunnel 默认阻止把免鉴权 MCP 暴露公网。已有独立可信鉴权边界的高级部署可用精确值 `OMBRE_ALLOW_INSECURE_MCP=true` 显式承担风险并放行，其他宽松真值不会生效。
+
+### 兼容 / Compatibility
+
+- 三份官方 Compose 模板把宿主端口绑定 `OMBRE_BIND_ADDRESS` 传入容器，默认 `127.0.0.1` 免鉴权部署可被安全识别。仅热更新代码的旧 Docker 实例因无法证明宿主边界会安全回退为鉴权；更新 Compose 并重建容器后恢复明确边界，记忆数据不受影响。
+- Dashboard、首次部署向导和系统诊断现在显示门禁、容器宿主边界及高风险豁免状态，避免把“可信局域网”误解为可匿名读写。
+
+### 测试 / Tests
+
+- 增加回环地址、通配/局域网地址、Docker 已知与未知宿主边界、严格逃生阀、启动期收紧、配置保存及 Tunnel 暴露的安全矩阵回归。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.12`。
+
+## 2.8.11
+
+### 修复 / Fixed
+
+- `/auth/status` 响应明确禁止缓存，Dashboard 与安全部署向导请求该状态时也主动绕过 HTTP 缓存，避免浏览器或中间缓存复用过期的首次设置与登录状态。
+- Dashboard 登录失败时按现有 `/auth/login` 响应契约读取 `error` 字段并显示具体提示，避免将限流、服务繁忙等错误统一显示为“密码错误”。
+
+### 测试 / Tests
+
+- 补充服务端响应头、Dashboard 与安全部署向导请求缓存策略的回归测试，以及登录失败错误展示的用户可见 DOM 回归测试。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.11`。
+
+## 2.8.10
+
+### 修复 / Fixed
+
+- 系统诊断不再因 Dashboard 查询而在真实记忆库重建 SQLite 投影或创建 vNext WAL；重扫移出事件循环，向量投影改为逐行校验，避免 512 MiB 实例同时保留全库向量 JSON。
+- embedding 查询缓存改为服务商实际可见前缀的固定长度摘要，不再保留超长记忆原文；向量库替换成功但配置发布失败时明确进入 `publish_failed`，不再误报完成。
+- Dashboard 配置和采样参数统一拒绝越界值、非整数小数、布尔值及 `NaN/Inf`；采样设置与 MCP 静态 Token 只在持久化成功后发布到运行态，并串行提交落盘与运行态更新，避免并发请求造成状态漂移。
+- 14 个公开 MCP 工具统一拒绝未知参数，避免拼错字段被静默忽略后仍产生写入。
+
+### 安全 / Security
+
+- MCP 操作日志不再复制查询、标题等私密文本，异常正文与 traceback 不再进入响应、持久错误或日志，失败响应也不再附带其他调用的全局日志；breath、信件与 `I` 读取的存储原文增加内容绑定的数据边界。
+- OAuth 动态注册增加未授权客户端独立配额和回调地址总长度限制；媒体路径读取拒绝符号链接、特殊文件、并发路径替换及超限内容。
+
+### 测试 / Tests
+
+- 扩充 14 工具 Docker 集成、数值与 payload 边界、持久化失败、并发冲突、隐私日志、路径竞态及 prompt 注入数据边界回归。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.10`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.9
+
+### 修复 / Fixed
+
+- 固定 CI 依赖锁解析所使用的包索引时间点；即使从空输出重建也会得到现有生产锁与开发锁，避免上游索引发布新版本后在没有依赖输入变更时误报漂移，同时保持旧实例热更新认可的生产锁摘要不变。
+- 补齐记忆详情对 `meaning` 字段的展示：新桶保存的多条体验锚点现在会在 Dashboard 标题下按原顺序显示为暖金引用块，不再出现“数据已写入但 UI 完全看不到”的情况。
+- 兼容早期手写或旧备份中以单个字符串保存的 `meaning`；空值不生成占位块，长文本保留换行并安全折行。
+- 所有 meaning 文本在进入详情 DOM 前统一转义，恶意 HTML 只会作为普通文字显示；列表接口仍保持精简，不额外传输最多 50 条的完整 meaning 数据。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.9`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.8
+
+### 修复 / Fixed
+
+- 修复热更新器把 `requirements.txt` 文本变化误判成实际依赖变化的问题；2.8.8 起依赖门禁以正式 `requirements.lock.txt` 为准，仅兼容旧更新包时回退源清单。官方 GitHub 热更新归档不再携带宽松源清单，因此 2.8.4 存量实例可直接点击热更新进入新版逻辑，无需重建镜像或临时放行 pip。
+- Git 克隆、CI 与常规源码构建仍保留 `requirements.txt`；GitHub Download ZIP 与 Dashboard 热更新归档只携带带 hash 的发布锁。Dockerfile 同步兼容“归档中仅有 lock”的构建方式，避免一键直升修复影响 ZIP 部署用户。
+- 依赖清单比较会规范化 CRLF/LF；Docker 持久代码目录缺少根级清单时会回退镜像内置基线。更新成功、镜像重新播种与崩溃回滚均同步两份清单，失败时连同“原本不存在”的状态一起精确还原。
+- 发布锁真实变化时仍默认拒绝自动安装；明确开启 `OMBRE_UPDATE_ALLOW_PIP` 后改用 `--require-hashes` 安装锁文件。新代码先通过编译自检才会执行 pip，避免失败代码污染解释器环境，不降低原有供应链安全边界。
+- 一键直升兼容规则绑定 2.8.4 的发布锁摘要；兼容规则存续期间若依赖锁发生变化，回归测试会强制失败并要求先提供显式迁移方案。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.8`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.7
+
+### 修复 / Fixed
+
+- 修复 `hold` 新建桶时，文件系统不支持锁、资源耗尽或 I/O 异常被一律误判为“锁正在占用”，最终等待 30 秒后才抛 `TimeoutError` 的问题；现在只重试真正的共享/锁冲突，其他系统错误立即保留原始 `errno` 报出，并附带逻辑 key、锁路径与持有者摘要用于诊断。
+- 缩短 `hold/grow/trace/历史导入` 合并与编辑路径的租约：Markdown 原子提交后先释放桶锁，再登记 content/meaning 派生状态；同步兼容模式调用外部 embedding 前也已释放 identical-content、merge-target 与 importance/pinned 配额锁，慢 provider 不再阻塞后续写入。
+- 同桶派生索引按跨进程顺序执行，并在 provider 返回后回读最新 Markdown；并发更新或较新请求被取消时，会继续把 content/meaning 收敛到最新值，避免迟到的旧向量覆盖新状态及重复生成同一最终向量。软删除并发发生时会在独立派生租约内复核是否已恢复，再清理迟到记录。
+- embedding outbox 升级为 content/meaning 分组件调度、退避与哈希 CAS；单个 meaning 长期失败不再饿死正文向量。多个实例共享同一 vault 时，整份队列更新会在稳定 sidecar OS lease 内执行 `reload → merge/CAS → fsync → replace`，避免互相覆盖或旧 worker 复活已完成任务。
+- 补齐历史导入合并、`trace(old_str/new_str)` 同时更新 meaning、恢复归档和全库人名替换等私有更新路径的锁外索引刷新，避免正文已更新但向量仍停留在旧内容。
+- 文件租约初始化、上下文异常、任务取消及显式解锁失败路径统一保证关闭 descriptor；锁文件残留本身不会再被误诊为仍有活动内核租约。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.7`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.6
+
+### 修复 / Fixed
+
+- 修复首次完成设置、密码登录或安全问题恢复后，Dashboard 仍停留在空白/未初始化状态、必须手动刷新页面才显示数据的问题；三条认证成功路径现在统一进入同一个完整初始化流程。
+- 受保护的数据请求、心跳与错误轮询延后到认证成功后启动，退出登录时同步停止；并用单飞与认证代次校验处理重复初始化、退出后快速重登和旧 `/auth/status` 响应回写等竞态，避免重复定时器或旧会话覆盖新界面。
+- 当前活动页签（包括 `#letters` 旧书签）会在认证完成后主动刷新，个人条目入口也随本次会话重新加载，无需整页重载。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.6`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.5
+
+### 修复 / Fixed
+
+- 增强 Streamable HTTP 对无法正确处理有状态会话或 SSE 响应的客户端的兼容性，覆盖反馈环境中 Kelivo “能读到 `Ombre Brain` 服务名、但显示 0 工具”的表象：`/mcp` 现在使用无状态、直接 JSON 响应，初始化后无需保存/回传 `Mcp-Session-Id` 也能稳定列出全部 14 个工具。
+- 删除 14 工具“主/副 FastMCP 实例 + 启动时操作私有注册表合并”的历史机制；全部工具直接注册到唯一公开实例，避免导入式 ASGI 启动或 SDK 私有结构变化时静默退化为 7 工具。
+- CORS 响应显式暴露 MCP/OAuth 排障头，legacy SSE 启动日志改为输出真实 `/sse` 地址，避免客户端被误导到 `/mcp`。
+- `/mcp` 对省略 `Accept` 或仅发送通配媒体类型的简化客户端自动选择 JSON；显式只接受 SSE 时仍返回协议错误，避免发送客户端无法解析的响应。
+- MCP SDK 声明收紧为 `mcp>=1.27,<2`（生产锁定仍为 1.28.1），防止未来 v2 破坏性变更被非锁定安装静默带入。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.5`。
+
+## 2.8.4
+
+### 修复 / Fixed
+
+- 修复 `digested=1` 只改变字段却仍会出现在无参 `breath()` 的问题：spontaneous/dream 策略现在硬过滤已消化桶，不再受 importance、pinned 或 3% 偶遇影响；带 query 的真实命中、importance 审计和 catalog 目录仍可显式找回。查询结果不足时追加的“非检索命中”随机漂浮也改用 spontaneous 策略，不再旁带 digested、dont_surface 或 anchor 桶。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.4`，Dashboard、运行时与热更新检查显示一致。
+
+## 2.8.3
+
+### 修复 / Fixed
+
+- 修复"我 / Self"面板（dashboard.html 左下角 `I` 按钮）在窄屏设备上宽度固定溢出屏幕、显示不全的问题；连带把详情侧滑面板与自我面板的宽度都改成 `min(定宽, calc(100vw - 边距))` 自适应公式，替换掉原来"基础规则写死宽度 + 单独一条 `@media` 补丁"的模式，避免同类遗漏再次出现。
+- 修复"我 / Self"面板关闭按钮未贴靠面板右边缘的问题。
+- 修复手机端「写一封信」日期选择器点不开：原实现把真实 `<input type="date">` 藏成 1px 透明元素，靠 JS 调 `showPicker()`/`click()` 唤起原生选择器，但 iOS Safari 等移动浏览器只认落在控件本体上的真实点击，程序模拟点击不生效；现在改为直接展示原生日期输入框，任何设备直接点选。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.3`。
+
+## 2.8.2
+
+### 修复 / Fixed
+
+- 修复 Zeabur 等跨域部署在 Streamable HTTP + 静态 Token 鉴权下无法连接 `/mcp`：浏览器的 `OPTIONS /mcp` 预检现在显式跳过 MCP 鉴权，CORS 中间件调整到鉴权外层，预检不再返回无 CORS 响应头的 401；鉴权失败响应也会携带正确的 CORS 响应头，Polaris 网页版和桌面版可正常发起后续带 Token 请求。
+
+### 维护 / Maintenance
+
+- 完成 2.7.8 启动、跨越 2.7.8—2.7.10 三个正式版本的首批 `src/` 扁平模块兼容观察期：经生产引用、测试、活动文档与部署入口审计后，移除 memory/plan/provider/public-origin/scoring、storage/deployment、ledger/projection 共 16 个顶层兼容壳；仓库测试全部切换到 `ombrebrain.*` canonical package，避免内部代码继续延长旧路径生命周期。
+- 修正内部资料忽略边界：`docs/superpowers/`、代码健康审计、内部 TODO 与旧版发布草稿不再受 Git 跟踪，并补入 `.gitignore`；运行时覆盖矩阵不再发布内部计划文件路径。
+
+### 测试 / Tests
+
+- 新增鉴权中间件预检放行与完整 Streamable HTTP 中间件栈回归，覆盖静态 Token 模式下 `OPTIONS /mcp` 返回 200、允许 `POST` 及 `Authorization`/`Content-Type` 请求头。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.2`。
+
+## 2.8.0
+
+### 修复 / Fixed
+
+- 保留 `hold` 与 `grow(items=...)` 的自动合并能力，同时在相似候选之后增加保守的“同一具体事件”判定；仅主题、人物或情绪相似，日期、场景或关键动作不同的独立事件不再串入旧桶，完全相同正文继续保持幂等。
+- 修复 `breath_advanced(catalog=True)` 忽略 `tags` 与 `max_results`：目录模式现在执行 tags AND 过滤并遵守返回上限，仍保持 0 LLM、只读元数据。
+- `breath_search` 与 `breath_advanced` 新增 `date_from/date_to` 创建日期过滤，支持 `YYYY-MM-DD` 与 ISO 8601；自由联想也受同一日期范围约束，避免按日期检索时漂出范围外旧桶。
+- 为语义检索补充不记录查询原文的诊断日志，包含查询哈希、向量候选与得分、embedding 引擎和耐久 outbox 状态，便于区分索引未更新、服务不可用和排序结果问题。
+- OAuth 授权页增加提交中状态、重复提交保护、30 秒超时提示与诊断编号；服务端按同一编号记录提交、密码失败和跳转阶段，便于定位授权页面卡住。
+
+### 行为说明 / Behavior
+
+- 保留检索命中不足时浮现 3–5 条低权重旧记忆的自由联想设计，并以“非检索命中”独立分区明确标记。
+- 保留核心准则无条件注入设计；传入 tags 时会明确说明 tags 只过滤普通浮现记忆。
+
+### 部署 / Deployment
+
+- 新建并验证 Zeabur 一键部署模板 `WB5ZKE`，README 部署按钮已指向新模板，同时保留 Deploy from GitHub 备用流程。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.8.0`。
+
+## 2.7.9
+
+### 修复 / Fixed
+
+- 修复 `grow` 长内容拆分所用的 digest prompt 未注入第一人称视角铁律：现在与 dehydrate/merge 共用同一规则，AI 自身保持“我”，人类一方保持配置名称，并禁止动作或情绪主语翻转（#62）。
+
+### 文档 / Documentation
+
+- 补清 Zeabur/Render 反代后的 OAuth 公网来源配置：标准 `X-Forwarded-Proto` / `X-Forwarded-Host` 已受支持，但只采信可信最后一跳；托管平台应在安全部署向导填写 HTTPS 公网地址，避免 OAuth 元数据回落为容器内部 `http://`，同时禁止用 `0.0.0.0/0` 放宽代理信任（#63）。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.9`。
+
+## 2.7.8
+
+### 维护 / Maintenance
+
+- 渐进整理 `src/` 根目录：将领域消息、计划历史、服务商识别、公开来源校验、部署模式、检索评分、媒体与备份存储、embedding outbox、ledger 及 projection 实现迁入 `ombrebrain/` 对应领域包；仓库内生产代码改用新的 canonical package 路径。
+- 旧的顶层 Python 导入路径暂时保留为轻量兼容壳。本版本开始计算三个正式版本的弃用观察期：`2.7.8`、`2.7.9`、`2.7.10` 保持兼容；最早在 `2.7.11` 经引用、文档、部署和完整回归审计后删除，不能仅按版本号自动移除。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.8`。
+
+## 2.7.7
+
+### 修复 / Fixed
+
+- `trace` 正式支持 `old_str/new_str` 原文片段局部替换：在单桶跨进程锁内读取完整正文并仅替换唯一的逐字命中，长 pinned 桶尾部同样有效；零命中、重叠或普通多命中、替换后正文为空都会明确拒绝且不写盘，`new_str=""` 可删除不会清空整桶的局部片段。替换后的正文继续受 50KB 上限约束并正常重建 embedding，plan 并发编辑也会在锁内追加 change log。`content` 与局部替换互斥，未知或拼错的 trace 参数也不再被 FastMCP 静默吞掉后误报“没有任何字段需要修改”。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.7`，Dashboard、运行时和热更新检查显示一致。
+
+## 2.7.6
+
+### 修复 / Fixed
+
+- 修复脱水视角规则的反向遗漏：禁止把人类一方的动作或情绪误归给“我”；原文省略主语时优先依据紧邻上下文，无法判断则保留省略结构，不再擅自补成第一人称，并通过 prompt v4 使旧脱水缓存自然失效。
+- 记忆桶批量选择的“全选”改为只作用于当前页；翻页后复选框按当前页重新计算全选/半选状态，取消全选不会清掉其他页已手动选择的桶。
+- 修复记忆桶时间顺序下拉控件被全局表单 padding 挤压、文字下半部遭裁剪的问题；控件现在使用独立的垂直内边距和安全行高自适应内容。
+
+### 维护 / Maintenance
+
+- 清理历史对话导入合并路径中未使用的局部变量，保持全库静态检查通过。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.6`，Dashboard、运行时和热更新检查显示一致。
+
+## 2.7.5
+
+### 新增 / Added
+
+- “已导入记忆”卡片新增直接编辑入口：点击后读取完整桶正文并自动展开现有编辑器，保存后刷新卡片且保持列表滚动位置。
+
+### 修复 / Fixed
+
+- 修复云端与本地 embedding 配置串台：服务商预设现在会把 format、Base URL、model 与可选 Key 作为完整配置一次保存，迁移接口能正确持久化显式空 Base URL；本地 Ollama 会忽略残留的 Gemini/SiliconFlow 云端地址并使用独立本地地址，SiliconFlow 的 `bge-m3` 会安全规范为官方模型名 `BAAI/bge-m3`，错误面板及当前后端状态也会正确区分 `ollama` 与云 API。
+- 修复普通 `hold` 偶发误报“向量化失败”的竞态：新 Markdown 发布后会在任何 meaning/网络等待前立即对 ID 查询可见，后台 worker 不再把刚创建的桶误判为已删除并丢弃正文向量任务。
+- embedding outbox 对账改为单调补任务：衰减自愈或手动补齐拿到的旧快照不能再删除新任务、覆盖新 content hash 或重复入队；meaning-only 行会补建正文向量，而已有正文向量但旧版 hash 为空的历史行不会触发全库重算；记忆只移动到归档时保留待处理任务和已有向量，只有真正物理删除才清理。
+- Dashboard 向量补齐在清理孤儿索引前会回查 Markdown 真源，不再因扫描快照过时而误删并发 `hold` 刚生成的向量。
+- 若写入后的 outbox 任务异常缺失但向量仍未生成，`hold/grow` 会从 Markdown 真源自动重新入队；只有无法入队时才提示当前降级，不再把限流、超时或内部竞态一律误导为 API Key 错误。
+- Dashboard 详情与“已导入记忆”列表只接受最后一次请求结果，快速切换记忆或并发刷新时旧响应不再覆盖当前编辑对象和新卡片。
+
+### 安全 / Security
+
+- 本地 Ollama 运行时固定使用无秘密占位 token，保留在配置中供切回云端的 Gemini/SiliconFlow API Key 不再作为 Bearer 发往本地或自定义 Ollama 地址。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.5`，Dashboard、运行时和热更新检查显示一致。
+
+## 2.7.4
+
+### 修复 / Fixed
+
+- 修复取消钉选时 importance≥9 配额再次虚高的问题：计数现在与 `breath_advanced(importance_min=9)` 的可审计普通记忆范围一致，排除 pinned/protected、主动遗忘、feel/plan/letter、归档/删除终态，并按逻辑 bucket ID 去重；不再把 18 条普通高重要度误报为 89 条物理/特殊记录。
+- 同步修正 pinned 配额的旧数据计数：文本 `"false"` 不再被当成已钉选，同一 bucket ID 的物理副本只计一次，归档/删除终态不占名额。
+- 统一高重要度占位判定到 trace、Dashboard 快速解钉/完整编辑、导入复核、历史对话导入和单条/批量恢复浮现；所有从特殊/隐藏状态重新进入普通高重要度池的转换都会在同一配额锁内检查并落盘。新建或合并把低重要度桶提升到 9+ 时也不再绕过硬上限。
+- 修复配额/同内容写入队列中等待请求被取消后可能阻塞后续请求或提前打开串行屏障的问题；取消现在不会传播到前序 Future，交接回调也不会在非重入锁内自死锁。
+- 归档和软删除现在是存储层终态：快速钉选、Dashboard 编辑、导入复核或并发普通更新都不能再把 archived/deleted/tombstone 桶意外迁回活跃目录。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.4`，Dashboard、运行时和热更新检查显示一致。
+
+## 2.7.3
+
+### 新增 / Added
+
+- 记忆桶分页新增首页、末页和输入具体页码跳转；非法、空白、小数或越界页码会被安全归一化，删除末页内容或刷新后页数减少时自动收敛到有效末页。
+- 记忆桶新增“综合分优先 / 最新创建优先 / 最早创建优先”排序并记住用户选择；时间顺序按桶的首次 `created` 记录解析真实时区，缺失或无效时间稳定排在末尾，时间视图直接展示创建日期。
+
+### 修复 / Fixed
+
+- 修复三个官方 Docker Compose 模板未透传 `OMBRE_TRUSTED_PROXY_CIDRS` 的部署缺陷；外置 nginx/Caddy 位于 Docker 网桥时，可信代理配置现在会真正进入容器，避免合法 Dashboard 写操作、热更新和重启因内部 Host/协议被误判为跨来源。
+- 热更新失败时读取并显示服务端错误；若命中 `Cross-origin request rejected`，Dashboard 会明确提示这是 CSRF 来源校验而非 CORS，并指向 Host、HTTPS 转发头和最后一跳代理 CIDR。
+- 补充 nginx 安全反代示例、非默认端口规则及 v2.7.0 无法通过 Dashboard 自更新时的宿主机脱困步骤；不放宽热更新或重启接口的 CSRF 保护。
+- 修复空记忆筛选残留旧页码/全选状态、非法时间显示 `NaNmo前`，并让同分桶及同时间桶在刷新后的顺序保持确定；切换排序时不会因当前 domain 掉出前 10 而误退回“全部”，容器与浏览器时区不同时也使用服务端规范化时间保持排序和显示一致。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.3`，Dashboard、运行时和热更新检查显示一致。
+
+## 2.7.2
+
+### 修复 / Fixed
+
+- 澄清并锁定 `trace` 删除契约：普通记忆与 plan 的 `hard_delete` 会明确拒绝且不再被误解为顺带归档；测试桶清理必须提供非空、最多 500 字符的 `delete_reason`，并拒绝与 `delete=True` 同时使用。形式化不变量现在只依据创建事件中的不可变 `test_data` provenance 豁免合法测试清理，删除事件无法自行伪造该资格。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新优先读取的 `src/VERSION` 同步更新为 `2.7.2`，Dashboard、运行时和热更新检查显示一致。
+
+## 2.7.1
+
+### 修复 / Fixed
+
+- 修复 `breath` 默认 token 预算、精准查询、`max_results`、`catalog` 与 pinned/core 渲染回归；目录模式不再注入全文，普通命中不会再被无关核心准则挤出预算。
+- 修复 Dashboard 记忆编辑、pinned/type/importance 联动，以及取消钉选或保存后丢失当前 tab/页码的问题。
+- 修复 grow/API Key 热更新与 GitHub 备份配置持久化；配置先原子落盘并回读成功后才更新运行时，不再出现界面报成功、重启后被旧值清空。
+- 修复 Dashboard 公网 MCP 地址与安全部署向导无法可靠保存/回读，以及 OAuth 换取 token 成功后 `/mcp` 循环 401：公网 origin 统一规范化并绑定 discovery、授权、刷新与 MCP 校验；旧地址授权要求重新认证，不再签发必然失效的 token。
+- 修复托管平台/反向代理改写 Host 或 HTTPS 协议时，Dashboard 同源的记忆编辑与两组 API Key 保存被 CSRF 防护误判为 `Cross-origin request rejected`；浏览器同源信号及已保存公网 origin 可安全放行，真实 `same-site`/`cross-site` 请求仍拒绝；无初始化 token 的首启设密同时校验回环 peer 与唯一回环 Host，阻断 DNS rebinding 抢占。
+- 完整备份迁移改为 disk-backed upload/extract/apply：请求先占位再流入 spool，桶与 SQLite 只保留路径，冲突在 bucket 锁内重验，`overwrite` 采用 staged commit + 历史副本 + 失败回滚；导入、解析、应用均以 generation 防并发串包。
+- 修复 Render 512 MB 场景下迁移、全量导出与日志读取的额外 OOM 风险；导出改为有上限的磁盘流式 ZIP/FileResponse，正常、Range 提前返回和断连均清临时文件，日志只倒序扫描有界尾部。
+- 强化登录、恢复与 OAuth 密码验证：PBKDF2 移出事件循环，加入跨 event-loop 并发上限、全局/来源双限流、有界来源状态及 IPv6 `/64` 聚合。
+- 强化 auth/OAuth rotation 原子性：密码/session/grant 使用 generation/CAS，code 与 refresh 单次消费，换密/revoke 阻断在途授权复活，持久化失败不会消费旧 grant 或发布半状态；DCR 增加双层限流、未激活 TTL 与安全驱逐。
+- 修复热更新跨 event-loop 双任务、同步 I/O/子进程阻塞和 SSE 断连竞态：进程级单飞占位，阻塞阶段移出事件循环，取消等待 worker 后回滚并清理，根目录与 `src/VERSION` 同步更新。
+- 强化持久化 prompt 注入数据边界与 dream/hook 最终预算：存储/派生内容显式标为不可执行数据，provenance 有界；dream 把完整渲染计入硬上限，hook 限制 provider 调用、并发与超时，token 只接受 header/Bearer。
+- 强化公开健康/引导接口、备份/下载边界、embedding 迁移单所有者与供应链完整性校验。
+- 完成全项目代码健康度、14 个 MCP 工具 Docker 集成、边界/异常路径及红蓝对抗测试；完整报告见 `docs/CODE_HEALTH_AUDIT_2026-07-15.md`。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与热更新必读的 `src/VERSION` 同步更新为 `2.7.1`，Dashboard 与热更新检查均可见。
+
 ## 2.7.0
 
 一次系统性找茬（对抗式代码审查）后的批量修复，覆盖安全、数据丢失、竞态、检索质量、历史对话导入四类问题。

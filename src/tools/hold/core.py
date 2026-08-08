@@ -27,6 +27,8 @@ tools/hold/core.py — hold 普通存入分支（含自动合并）
 
 import asyncio
 
+from utils import normalize_memory_title
+
 from .. import _runtime as rt
 from .._common import merge_or_create, check_duplicate_for, check_plan_resolution
 
@@ -38,6 +40,7 @@ async def store_core(
     valence: float,
     arousal: float,
     why_remembered: str,
+    title: str = "",
     meaning: str = "",
     media: list | str | None = None,
     test_data: bool = False,
@@ -68,8 +71,10 @@ async def store_core(
     final_valence = valence if 0 <= valence <= 1 else (float(_v) if _v is not None else 0.5)
     final_arousal = arousal if 0 <= arousal <= 1 else (float(_a) if _a is not None else 0.3)
     _raw_tags = analysis.get("tags") or []
-    all_tags = list(dict.fromkeys((_raw_tags if isinstance(_raw_tags, list) else []) + extra_tags))
+    model_tags = _raw_tags if isinstance(_raw_tags, list) else []
+    all_tags = list(dict.fromkeys(extra_tags if extra_tags else model_tags))
     suggested_name = analysis.get("suggested_name", "")
+    final_title = title or normalize_memory_title(suggested_name)
 
     result_name, is_merged, embed_warn = await merge_or_create(
         content=content,
@@ -79,6 +84,7 @@ async def store_core(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        title=final_title,
         raw_merge=True,
         why_remembered=why_remembered,
         source_tool="hold",

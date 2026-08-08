@@ -9,6 +9,7 @@ from tools.breath import dispatch
 from tools.breath._verbatim import render_stored_bucket
 from tools.breath.importance import surface_by_importance
 from tools.breath.search import surface_search
+from tools.breath.surface import surface_default
 
 
 class ExplodingDehydrator:
@@ -201,7 +202,9 @@ async def test_token_budget_omits_whole_bucket_instead_of_truncating(monkeypatch
     manager = OrderedBucketManager([first, second])
     dehydrator = _install_runtime(manager)
     monkeypatch.setattr("tools.breath.search.random.random", lambda: 1.0)
-    _, first_cost = render_stored_bucket(first, "[bucket_id:first]")
+    _, first_cost = render_stored_bucket(
+        first, "[bucket_id:first]", "👣 Footprint：暂时无法读取"
+    )
 
     output = await _search("预算校验", max_tokens=first_cost)
     await asyncio.sleep(0)
@@ -212,6 +215,153 @@ async def test_token_budget_omits_whole_bucket_instead_of_truncating(monkeypatch
     assert "token 预算不足" in output
     assert manager.touched == ["first"]
     assert dehydrator.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_default_surface_skips_oversized_core_and_keeps_later_core(monkeypatch):
+    oversized = {
+        "id": "oversized-core",
+        "content": "oversized " * 400,
+        "metadata": {
+            "type": "permanent",
+            "importance": 10,
+            "pinned": True,
+            "domain": [],
+        },
+    }
+    later = {
+        "id": "later-core",
+        "content": "Later core rule must still surface in full.",
+        "metadata": {
+            "type": "permanent",
+            "importance": 10,
+            "pinned": True,
+            "domain": [],
+        },
+    }
+    manager = OrderedBucketManager([oversized, later])
+    _install_runtime(manager)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    _, later_cost = render_stored_bucket(
+        later,
+        "📌 [核心准则] [bucket_id:later-core]",
+        "👣 Footprint：暂时无法读取",
+    )
+
+    output = await surface_default(
+        max_results=10,
+        max_tokens=later_cost,
+        tag_filter=[],
+    )
+
+    assert "[bucket_id:later-core]" in output
+    assert later["content"] in output
+    assert "[bucket_id:oversized-core]" not in output
+    assert "token 预算不足" in output
+
+
+@pytest.mark.asyncio
+async def test_default_surface_skips_random_oversized_candidate_and_keeps_later_fit(
+    monkeypatch,
+):
+    top = {
+        "id": "top",
+        "content": "Top weighted memory.",
+        "metadata": {
+            "type": "dynamic",
+            "importance": 10,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    high = {
+        "id": "high",
+        "content": "Later high-importance memory must not be blocked.",
+        "metadata": {
+            "type": "dynamic",
+            "importance": 9,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    blocker = {
+        "id": "blocker",
+        "content": "blocking " * 400,
+        "metadata": {
+            "type": "dynamic",
+            "importance": 8,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    manager = OrderedBucketManager([top, high, blocker])
+    _install_runtime(manager)
+
+    def blocker_first(items):
+        items.sort(key=lambda bucket: bucket["id"] != "blocker")
+
+    monkeypatch.setattr("tools.breath.surface.random.shuffle", blocker_first)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    _, top_cost = render_stored_bucket(
+        top, "[权重:10.00] [bucket_id:top]", "👣 Footprint：暂时无法读取"
+    )
+    _, high_cost = render_stored_bucket(
+        high, "[权重:9.00] [bucket_id:high]", "👣 Footprint：暂时无法读取"
+    )
+    rt.config["surfacing"]["breath_max_tokens"] = top_cost + high_cost
+
+    output = await dispatch()
+
+    assert "[bucket_id:top]" in output
+    assert "[bucket_id:high]" in output
+    assert high["content"] in output
+    assert "[bucket_id:blocker]" not in output
+    assert "token 预算不足" in output
+    assert "有 1 条主要浮现记忆" in output
+
+
+@pytest.mark.asyncio
+async def test_oversized_passive_association_does_not_report_primary_truncation(
+    monkeypatch,
+):
+    top = {
+        "id": "top",
+        "content": "Primary surfaced memory.",
+        "metadata": {
+            "type": "dynamic",
+            "importance": 10,
+            "activation_count": 1,
+            "domain": [],
+        },
+    }
+    passive = {
+        "id": "passive",
+        "content": "optional passive " * 400,
+        "metadata": {
+            "type": "dynamic",
+            "importance": 9,
+            "activation_count": 1,
+            "last_active": "2020-01-01T00:00:00",
+            "domain": [],
+        },
+    }
+    manager = OrderedBucketManager([top, passive])
+    _install_runtime(manager)
+    monkeypatch.setattr("tools.breath.surface.random.shuffle", lambda items: None)
+    monkeypatch.setattr("tools.breath.surface.random.random", lambda: 1.0)
+    _, top_cost = render_stored_bucket(
+        top, "[权重:10.00] [bucket_id:top]", "👣 Footprint：暂时无法读取"
+    )
+
+    output = await surface_default(
+        max_results=1,
+        max_tokens=top_cost,
+        tag_filter=[],
+    )
+
+    assert "[bucket_id:top]" in output
+    assert "[bucket_id:passive]" not in output
+    assert "token 预算不足" not in output
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -56,8 +57,56 @@ TAIL_LOG_LINES = 15
 
 # 进程级锁：同一时刻只允许一个迁移任务
 _migration_lock = threading.Lock()
+_migration_owner_guard = threading.Lock()
+_migration_owner: "MigrationReservation | None" = None
 _migration_task: asyncio.Task | None = None
 _v3_runtime: Any = None
+
+
+@dataclass(frozen=True)
+class MigrationReservation:
+    """Opaque ownership token for one embedding migration attempt.
+
+    The web route reserves the process-wide migration slot *before* it creates
+    or resets the staging database and before it awaits the provider probe.
+    ``start_migration`` then transfers that same reservation to the background
+    task.  Keeping ownership explicit prevents a losing concurrent request
+    from touching another job's staging/checkpoint/outbox lifecycle.
+    """
+
+    job_id: str
+
+
+def reserve_migration() -> MigrationReservation | None:
+    """Atomically reserve the single migration slot without starting a task."""
+
+    global _migration_owner
+    if not _migration_lock.acquire(blocking=False):
+        logger.info("[migration] another migration already in progress; skip")
+        return None
+    reservation = MigrationReservation(job_id=uuid.uuid4().hex)
+    with _migration_owner_guard:
+        _migration_owner = reservation
+    return reservation
+
+
+def owns_migration_reservation(reservation: MigrationReservation) -> bool:
+    """Return whether ``reservation`` is the active migration owner."""
+
+    with _migration_owner_guard:
+        return _migration_owner is reservation
+
+
+def release_migration_reservation(reservation: MigrationReservation) -> bool:
+    """Release ``reservation`` iff it still owns the migration slot."""
+
+    global _migration_owner
+    with _migration_owner_guard:
+        if _migration_owner is not reservation:
+            return False
+        _migration_owner = None
+        _migration_lock.release()
+    return True
 
 
 def attach_v3_runtime(runtime) -> None:
@@ -87,7 +136,7 @@ def checkpoint_path_for(buckets_dir: str) -> str:
 
 def _empty_status() -> dict[str, Any]:
     return {
-        "phase": "idle",      # idle | running | completed | failed
+        "phase": "idle",      # idle | running | completed | failed | publish_failed
         "total": 0,
         "done": 0,
         "failed_count": 0,
@@ -381,29 +430,7 @@ async def _run_migration(
 
     finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     success = all_done and not swap_error
-    final_phase = "completed" if success else "failed"
-    if swap_error:
-        final_msg = f"迁移全部完成但原子替换主库失败，向量仍留在暂存文件：{swap_error}"
-    else:
-        final_msg = f"迁移完成：{len(done_ids)} 成功 / {failed_count} 失败"
-    tail = []
-    if failed_count > 0 or swap_error:
-        # 失败时附 log + 引导提示
-        tail = _tail_errors_log(cfg.buckets_dir)
-
-    cur = read_status(status_path)
-    cur.update({
-        "phase": final_phase,
-        "current_id": "",
-        "done": len(done_ids),
-        "failed_count": failed_count if not swap_error else max(failed_count, 1),
-        "failed_items": failed_items,
-        "finished_at": finished_at,
-        "message": final_msg,
-        "error": swap_error,
-        "tail_log": tail,
-    })
-    write_status(status_path, cur)
+    publish_errors: list[str] = []
 
     # 成功后把 embeddings_meta 更新为目标后端的 model/dim，
     # 否则 db_meta 还是旧值（如 gemini/768），重启会误报 OB-W005 维度不一致。
@@ -413,6 +440,7 @@ async def _run_migration(
             cfg.target_engine._write_meta("vector_dim", str(cfg.target_dim or 0))
         except Exception as e:
             logger.warning(f"[migration] update meta failed: {e}")
+            publish_errors.append(f"元数据发布失败: {type(e).__name__}: {e}")
 
     # 完成后清掉 checkpoint（下次切换从头开始）——只有真正 swap 成功才清，
     # swap 失败时必须留着，好让下次重试从断点续传，而不是把 staging db 里
@@ -429,31 +457,89 @@ async def _run_migration(
             on_complete(success)
         except Exception as e:
             logger.warning(f"[migration] on_complete callback failed: {e}")
+            if success:
+                publish_errors.append(
+                    f"运行态/配置发布失败: {type(e).__name__}: {e}"
+                )
+
+    final_phase = "completed" if success else "failed"
+    if swap_error:
+        final_msg = f"迁移全部完成但原子替换主库失败，向量仍留在暂存文件：{swap_error}"
+        final_error = swap_error
+    elif success and publish_errors:
+        final_phase = "publish_failed"
+        final_error = "; ".join(publish_errors)
+        final_msg = f"向量主库已替换，但迁移结果发布未完整完成：{final_error}"
+    else:
+        final_msg = f"迁移完成：{len(done_ids)} 成功 / {failed_count} 失败"
+        final_error = ""
+
+    tail = []
+    if failed_count > 0 or swap_error or publish_errors:
+        # 失败时附 log + 引导提示
+        tail = _tail_errors_log(cfg.buckets_dir)
+
+    cur = read_status(status_path)
+    cur.update({
+        "phase": final_phase,
+        "current_id": "",
+        "done": len(done_ids),
+        "failed_count": failed_count if not swap_error else max(failed_count, 1),
+        "failed_items": failed_items,
+        "finished_at": finished_at,
+        "message": final_msg,
+        "error": final_error,
+        "tail_log": tail,
+    })
+    write_status(status_path, cur)
 
 
 def start_migration(
     cfg: MigrationConfig,
     loop: asyncio.AbstractEventLoop | None = None,
     on_complete: Callable[[bool], None] | None = None,
+    *,
+    reservation: MigrationReservation | None = None,
 ) -> asyncio.Task | None:
     """在指定 event loop 上启动后台迁移任务。
 
     同一时刻只允许一个迁移任务，重复调用返回 None。
     """
     global _migration_task
-    if not _migration_lock.acquire(blocking=False):
-        logger.info("[migration] another migration already in progress; skip")
+    active_reservation = reservation or reserve_migration()
+    if active_reservation is None:
+        return None
+    if not owns_migration_reservation(active_reservation):
+        logger.warning("[migration] rejected stale or foreign reservation")
         return None
 
     target_loop = loop or asyncio.get_event_loop()
+    callback_called = False
+
+    def _complete_once(success: bool) -> None:
+        nonlocal callback_called
+        if callback_called:
+            return
+        callback_called = True
+        if on_complete:
+            on_complete(success)
 
     async def _wrap():
         try:
-            await _run_migration(cfg, on_complete=on_complete)
+            await _run_migration(cfg, on_complete=_complete_once)
+        except BaseException:
+            # Cancellation and unexpected worker failures must still restore
+            # caller-owned resources such as the embedding outbox.
+            _complete_once(False)
+            raise
         finally:
-            _migration_lock.release()
+            release_migration_reservation(active_reservation)
 
-    task = target_loop.create_task(_wrap())
+    try:
+        task = target_loop.create_task(_wrap())
+    except BaseException:
+        release_migration_reservation(active_reservation)
+        raise
     _migration_task = task
     return task
 
@@ -464,12 +550,14 @@ def is_running() -> bool:
 
 def reset_for_test() -> None:
     """测试用：强制释放锁。"""
-    global _migration_task
-    if _migration_lock.locked():
-        try:
-            _migration_lock.release()
-        except RuntimeError:
-            pass
+    global _migration_owner, _migration_task
+    with _migration_owner_guard:
+        _migration_owner = None
+        if _migration_lock.locked():
+            try:
+                _migration_lock.release()
+            except RuntimeError:
+                pass
     _migration_task = None
 
 
@@ -480,6 +568,10 @@ __all__ = [
     "read_status",
     "write_status",
     "backup_db_once",
+    "MigrationReservation",
+    "reserve_migration",
+    "owns_migration_reservation",
+    "release_migration_reservation",
     "start_migration",
     "is_running",
     "reset_for_test",
