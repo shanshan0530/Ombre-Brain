@@ -29,6 +29,7 @@ tools/breath/search.py — 有 query 的检索模式
 import asyncio
 import hashlib
 import random
+import re
 from datetime import datetime, time
 
 from ombrebrain.policy.surfacing import SurfacePolicyVM
@@ -43,6 +44,49 @@ _VECTOR_QUERY_TOPK = 50
 
 _SEMANTIC_DISABLED_NOTE = "[检索降级：语义索引暂不可用，本次仅使用关键词/BM25。]"
 _BUDGET_NOTICE = "[token 预算不足：命中的下一条记忆未被截断或摘要，请提高 max_tokens 后重试。]"
+
+
+_ADDRESS_PREFIX_RE = re.compile(
+    r"^\s*(?:老公|老婆|亲爱的|宝贝|宝宝|daddy)\s*[，,、:：]?\s*",
+    re.IGNORECASE,
+)
+_RECALL_PREFIX_RE = re.compile(
+    r"^\s*(?:你\s*)?(?:(?:还|是否|能否|会不会)\s*)?"
+    r"(?:记得|记不记得|想得起|回忆得起)\s*",
+)
+_LEADING_POSSESSIVE_RE = re.compile(r"^(?:我们|咱们|你们|我|你)(?:的)?")
+_QUESTION_SUFFIX_RE = re.compile(r"\s*(?:吗|嘛|么|呢|不)[？?！!。.]?\s*$")
+
+
+def _focus_recall_query(query: str) -> str:
+    """Remove conversational recall scaffolding without rewriting the topic.
+
+    Memory callers often pass the complete user sentence. Relationship-facing
+    phrases such as ``老公你还记得关于我的`` can dominate an embedding even
+    though the actual lookup topic appears after ``关于``. This helper only
+    activates for explicit recall phrasing and falls back to the original query
+    whenever stripping would leave no useful text.
+    """
+    original = query.strip()
+    if not original:
+        return original
+
+    focused = _ADDRESS_PREFIX_RE.sub("", original, count=1)
+    has_recall_cue = bool(
+        re.search(r"记得|记不记得|想得起|回忆得起|关于", focused)
+    )
+    if not has_recall_cue:
+        return original
+
+    if "关于" in focused:
+        after_about = focused.rsplit("关于", 1)[1].strip()
+        if after_about:
+            focused = _LEADING_POSSESSIVE_RE.sub("", after_about, count=1) or after_about
+    else:
+        focused = _RECALL_PREFIX_RE.sub("", focused, count=1)
+
+    focused = _QUESTION_SUFFIX_RE.sub("", focused, count=1).strip(" ，,、:：")
+    return focused if focused else original
 
 
 def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
@@ -303,10 +347,12 @@ async def surface_search(
                 )
             return rendered
 
+    search_query = _focus_recall_query(query)
     vector_scores, semantic_notice = await _semantic_scores(
-        query, top_k=max(max_results, _VECTOR_QUERY_TOPK)
+        search_query, top_k=max(max_results, _VECTOR_QUERY_TOPK)
     )
-    semantic_diag = _semantic_diagnostics(query, vector_scores, semantic_notice)
+    semantic_diag = _semantic_diagnostics(search_query, vector_scores, semantic_notice)
+    semantic_diag["query_focused"] = search_query != query.strip()
     rt.logger.info("op=breath_search phase=semantic diagnostics=%s", semantic_diag)
 
     search_kwargs = {
@@ -319,14 +365,14 @@ async def surface_search(
     try:
         try:
             matches = await rt.bucket_mgr.search(
-                query, include_archive=True, **search_kwargs
+                search_query, include_archive=True, **search_kwargs
             )
         except TypeError as exc:
             # Lightweight third-party/test managers may predate the archive
             # option.  Preserve active search there; production supports it.
             if "include_archive" not in str(exc):
                 raise
-            matches = await rt.bucket_mgr.search(query, **search_kwargs)
+            matches = await rt.bucket_mgr.search(search_query, **search_kwargs)
     except Exception as e:
         rt.logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"

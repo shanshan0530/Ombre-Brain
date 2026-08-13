@@ -4,7 +4,7 @@ import pytest
 
 import tools._runtime as rt
 from embedding_engine import EmbeddingEngine
-from tools.breath.search import surface_search
+from tools.breath.search import _focus_recall_query, surface_search
 
 
 class EchoDehydrator:
@@ -84,6 +84,43 @@ async def run_search(query, *, domain="", tags=None):
         arousal=-1,
         tag_filter=tags or [],
     )
+
+
+def test_recall_question_focuses_on_topic_after_about():
+    assert _focus_recall_query("老公你还记得关于我的经期问题不") == "经期问题"
+
+
+def test_plain_search_query_is_not_rewritten():
+    assert _focus_recall_query("Project Halcyon deployment") == "Project Halcyon deployment"
+
+
+@pytest.mark.asyncio
+async def test_recall_scaffolding_does_not_drive_semantic_match(
+    bucket_mgr, decay_eng, monkeypatch
+):
+    cycle_id = await bucket_mgr.create(
+        content="经期可能伴随腹痛，需要留意周期变化。",
+        domain=["健康"],
+    )
+    relationship_id = await bucket_mgr.create(
+        content="这里是我们共同的家。",
+        domain=["关系"],
+    )
+
+    class QueryAwareEmbedding(StrictEmbedding):
+        async def search_similar_strict(self, query, top_k=10):
+            self.strict_calls += 1
+            assert query == "经期问题"
+            return [(cycle_id, 0.91), (relationship_id, 0.31)]
+
+    embedding = QueryAwareEmbedding()
+    install_runtime(bucket_mgr, decay_eng, EchoDehydrator(), embedding)
+    monkeypatch.setattr("tools.breath.search.random.sample", lambda *_args: [])
+
+    result = await run_search("老公你还记得关于我的经期问题不")
+
+    assert cycle_id in result
+    assert relationship_id not in result
 
 
 @pytest.mark.asyncio
@@ -226,6 +263,22 @@ async def test_missing_vector_does_not_reduce_keyword_candidate_score(bucket_mgr
     score_with = next(item["score"] for item in with_other_vector if item["id"] == target_id)
 
     assert score_with == score_without
+
+
+@pytest.mark.asyncio
+async def test_recency_and_importance_cannot_admit_unrelated_memory(bucket_mgr):
+    bucket_mgr._bm25 = None
+    unrelated_id = await bucket_mgr.create(
+        content="这里是我们共同的家。",
+        name="最重要的关系记忆",
+        domain=["关系"],
+        importance=10,
+    )
+    await bucket_mgr.update(unrelated_id, activation_count=10)
+
+    matches = await bucket_mgr.search("经期问题", vector_scores={})
+
+    assert unrelated_id not in {item["id"] for item in matches}
 
 
 @pytest.mark.asyncio

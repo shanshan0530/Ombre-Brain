@@ -521,6 +521,9 @@ class BucketManager:
         self.plan_dir = os.path.join(self.base_dir, "plans")
         self.letter_dir = os.path.join(self.base_dir, "letters")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
+        self.topic_relevance_min = float(
+            config.get("matching", {}).get("topic_relevance_min", 0.08)
+        )
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
         # --- Search scoring weights / 检索权重配置 ---
@@ -3458,10 +3461,19 @@ class BucketManager:
                 if literal_hit:
                     normalized = min(100.0, normalized + _LITERAL_MATCH_BONUS)
 
-                # Threshold check uses raw (pre-penalty) score so resolved buckets
-                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
-                # remain reachable by keyword (penalty applied only to ranking).
-                text_match = normalized >= self.fuzzy_threshold or literal_hit
+                # Relevance is an admission gate, while recency, importance and
+                # touch are ranking signals only. Previously those non-topic
+                # dimensions could lift an unrelated but vivid memory above the
+                # global fuzzy threshold. Literal/BM25/semantic evidence still
+                # provides independent recall paths.
+                bm25_score = bm25_scores.get(bucket["id"], 0.0)
+                topic_evidence = (
+                    topic_score >= self.topic_relevance_min
+                    or bm25_score > 0.0
+                )
+                text_match = literal_hit or (
+                    normalized >= self.fuzzy_threshold and topic_evidence
+                )
                 semantic_match = (
                     semantic_score is not None
                     and semantic_score >= _VECTOR_RECALL_THRESHOLD
