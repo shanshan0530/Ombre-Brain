@@ -273,12 +273,40 @@ async def test_recency_and_importance_cannot_admit_unrelated_memory(bucket_mgr):
         name="最重要的关系记忆",
         domain=["关系"],
         importance=10,
+        pinned=True,
     )
     await bucket_mgr.update(unrelated_id, activation_count=10)
 
     matches = await bucket_mgr.search("经期问题", vector_scores={})
 
     assert unrelated_id not in {item["id"] for item in matches}
+
+
+@pytest.mark.asyncio
+async def test_relevant_pinned_memory_ranks_before_equivalent_ordinary_memory(
+    bucket_mgr,
+):
+    ordinary_id = await bucket_mgr.create(
+        content="经期护理记录与周期变化。",
+        name="经期记录",
+        domain=["健康"],
+        importance=10,
+    )
+    pinned_id = await bucket_mgr.create(
+        content="经期护理记录与周期变化。",
+        name="经期记录",
+        domain=["健康"],
+        importance=10,
+        pinned=True,
+    )
+    bucket_mgr._bm25 = None
+
+    matches = await bucket_mgr.search("经期记录", vector_scores={})
+
+    ids = [item["id"] for item in matches]
+    assert pinned_id in ids
+    assert ordinary_id in ids
+    assert ids.index(pinned_id) < ids.index(ordinary_id)
 
 
 @pytest.mark.asyncio

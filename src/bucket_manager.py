@@ -524,6 +524,9 @@ class BucketManager:
         self.topic_relevance_min = float(
             config.get("matching", {}).get("topic_relevance_min", 0.08)
         )
+        self.pinned_relevance_bonus = float(
+            config.get("matching", {}).get("pinned_relevance_bonus", 5.0)
+        )
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
         # --- Search scoring weights / 检索权重配置 ---
@@ -3479,6 +3482,14 @@ class BucketManager:
                     and semantic_score >= _VECTOR_RECALL_THRESHOLD
                 )
                 if text_match or semantic_match:
+                    # A pin is a priority promise, not relevance evidence. It
+                    # may reorder already-admitted candidates, but can never
+                    # rescue an unrelated bucket through the admission gate.
+                    if meta.get("pinned") or meta.get("type") == "permanent":
+                        normalized = min(
+                            100.0,
+                            normalized + self.pinned_relevance_bonus,
+                        )
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
                     if meta.get("resolved", False):
