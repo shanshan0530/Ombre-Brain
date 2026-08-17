@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import errno
 import os
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import tools._runtime as rt
 from ombrebrain.storage.source_store import (
+    MAX_SOURCE_LINKS,
+    MAX_SOURCE_REFS,
     SourceStore,
+    normalize_source_links,
     normalize_source_ranges,
+    referenced_source_ids_from_markdown,
 )
 from tools.source_read import dispatch as source_read
+from tools.source_bindings import attach as source_attach, detach as source_detach, restore as source_restore
 from tools.hold import dispatch as hold
 from utils import count_tokens_approx
 
@@ -35,6 +41,13 @@ def test_source_ranges_are_normalized_and_selected(tmp_path):
     assert store.select_ranges("一\n二\n三\n四\n五\n", ranges) == "一\n二\n三\n五\n"
     with pytest.raises(ValueError, match="超出"):
         store.select_ranges("一\n二\n", [[2, 3]])
+
+
+def test_source_links_reject_duplicate_bindings():
+    ref = "src_" + "a" * 64
+    duplicate = {"ref": ref, "ranges": [[1, 2]], "status": "active"}
+    with pytest.raises(ValueError, match="重复绑定"):
+        normalize_source_links([duplicate, dict(duplicate, status="detached")])
 
 
 @pytest.mark.parametrize("invalid", [[[True, 1]], [[1.5, 2]], [["1", 2]]])
@@ -250,6 +263,376 @@ async def test_hold_explicit_tags_replace_model_suggestions(
     bucket = await bucket_mgr.get(bucket_id)
     assert bucket["metadata"]["tags"] == ["人工标签"]
     assert bucket["metadata"]["title"] == "模型标题"
+
+
+@pytest.mark.asyncio
+async def test_hold_explicit_domain_wins_over_model_suggestion(
+    bucket_mgr, monkeypatch
+):
+    class Dehydrator:
+        async def analyze(self, _content):
+            return {
+                "domain": ["模型域"],
+                "valence": 0.5,
+                "arousal": 0.3,
+                "tags": [],
+                "suggested_name": "模型标题",
+            }
+
+        def invalidate_cache(self, _content):
+            return None
+
+    class Decay:
+        async def ensure_started(self):
+            return None
+
+    monkeypatch.setattr(rt, "config", {"limits": {}, "merge_threshold": 75})
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "dehydrator", Dehydrator())
+    monkeypatch.setattr(rt, "decay_engine", Decay())
+    monkeypatch.setattr(rt, "logger", MagicMock())
+    monkeypatch.setattr(rt, "fire_webhook", None)
+    monkeypatch.setattr(rt, "mark_op", None)
+
+    result = await hold(content="人工 domain 优先。", domain="人工域")
+    bucket_id = result.split("→", 1)[1].split()[0]
+    bucket = await bucket_mgr.get(bucket_id)
+    assert bucket["metadata"]["domain"] == ["人工域"]
+
+
+@pytest.mark.asyncio
+async def test_hold_optional_source_content_uses_shared_source_layer(
+    bucket_mgr, monkeypatch
+):
+    class Dehydrator:
+        async def analyze(self, _content):
+            return {
+                "domain": ["旅行"],
+                "valence": 0.8,
+                "arousal": 0.5,
+                "tags": ["京都"],
+                "suggested_name": "京都计划",
+            }
+
+        def invalidate_cache(self, _content):
+            return None
+
+    class Decay:
+        async def ensure_started(self):
+            return None
+
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "config", {"limits": {}, "merge_threshold": 75})
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "dehydrator", Dehydrator())
+    monkeypatch.setattr(rt, "decay_engine", Decay())
+    monkeypatch.setattr(rt, "source_store", store)
+    monkeypatch.setattr(rt, "logger", MagicMock())
+    monkeypatch.setattr(rt, "fire_webhook", None)
+    monkeypatch.setattr(rt, "mark_op", None)
+
+    source = "第一行：讨论目的地\n第二行：决定去京都\n第三行：约定时间\n"
+    existing_ref = store.put(source)
+    result = await hold(
+        content="我们决定下个月一起去京都。",
+        title="京都计划",
+        source_content=source,
+    )
+    bucket_id = result.split("→", 1)[1].split()[0]
+    bucket = await bucket_mgr.get(bucket_id)
+    refs = bucket["metadata"]["source_refs"]
+
+    assert refs[0]["ref"] == existing_ref
+    assert len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source"))) == 1
+    assert refs[0]["ranges"] == [[1, 3]]
+    assert store.read(refs[0]["ref"]) == source
+
+    event = await source_read(bucket_id, "京都计划", scope="event")
+    assert "第一行：讨论目的地" in event
+    assert "第三行：约定时间" in event
+
+
+@pytest.mark.asyncio
+async def test_hold_source_ranges_select_event_and_merge_appends_evidence(
+    bucket_mgr, monkeypatch
+):
+    class Dehydrator:
+        async def analyze(self, _content):
+            return {
+                "domain": ["旅行"],
+                "valence": 0.8,
+                "arousal": 0.5,
+                "tags": [],
+                "suggested_name": "去了京都",
+            }
+
+        def invalidate_cache(self, _content):
+            return None
+
+    class Decay:
+        async def ensure_started(self):
+            return None
+
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "config", {"limits": {}, "merge_threshold": 75})
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "dehydrator", Dehydrator())
+    monkeypatch.setattr(rt, "decay_engine", Decay())
+    monkeypatch.setattr(rt, "source_store", store)
+    monkeypatch.setattr(rt, "logger", MagicMock())
+    monkeypatch.setattr(rt, "fire_webhook", None)
+    monkeypatch.setattr(rt, "mark_op", None)
+
+    memory = "我们今天真的去了京都。"
+    first = await hold(
+        content=memory,
+        title="去了京都",
+        source_content="前情\n今天到了京都\n去了清水寺\n收尾\n",
+        source_ranges=[[2, 3]],
+    )
+    bucket_id = first.split("→", 1)[1].split()[0]
+    event = await source_read(bucket_id, "去了京都", scope="event")
+    assert "今天到了京都" in event
+    assert "去了清水寺" in event
+    assert "前情" not in event
+    assert "收尾" not in event
+
+    second = await hold(
+        content=memory,
+        title="去了京都",
+        source_content="另一段独立原话",
+    )
+    assert second.startswith("合并→")
+    bucket = await bucket_mgr.get(bucket_id)
+    assert len(bucket["metadata"]["source_refs"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_hold_source_ranges_require_source_content(bucket_mgr, monkeypatch):
+    class Decay:
+        async def ensure_started(self):
+            return None
+
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "decay_engine", Decay())
+    monkeypatch.setattr(rt, "mark_op", None)
+
+    result = await hold(
+        content="这条不应该写进去。",
+        title="无原文",
+        source_ranges=[[1, 1]],
+    )
+    assert "source_ranges 需要同时提供 source_content" in result
+    assert await bucket_mgr.list_all() == []
+
+
+@pytest.mark.asyncio
+async def test_source_link_slots_are_reversible_and_read_selectively(bucket_mgr, monkeypatch):
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "source_store", store)
+    bucket_id = await bucket_mgr.create("memory", title="evidence", tags=["keep"], importance=7)
+    before = await bucket_mgr.get(bucket_id)
+
+    assert "slot=1" in await source_attach(bucket_id, "evidence", "alpha\n")
+    assert "slot=2" in await source_attach(bucket_id, "evidence", "beta\n")
+    assert "ranges=1-1,3-3" in await source_attach(
+        bucket_id, "evidence", "one\ntwo\nthree\n", [[3, 3], [1, 1]]
+    )
+    manifest = await source_read(bucket_id, "evidence")
+    assert "slot=1" in manifest and "alpha" not in manifest
+    assert "alpha" in await source_read(bucket_id, "evidence", source_slots=[1])
+    assert "beta" in await source_read(bucket_id, "evidence", source_slots=[2])
+    both = await source_read(bucket_id, "evidence", source_slots=[2, 1])
+    assert both.index("alpha") < both.index("beta")
+    all_sources = await source_read(bucket_id, "evidence", all_sources=True)
+    assert "alpha" in all_sources and "beta" in all_sources
+    selected = await source_read(bucket_id, "evidence", source_slots=[3, 1, 3])
+    assert selected.index("alpha") < selected.index("one")
+    assert selected.count("one") == 1
+    assert "detached" in await source_detach(bucket_id, "evidence", 1)
+    assert "source_detach ok" in await source_detach(bucket_id, "evidence", 1)
+    assert "source_restore" in await source_attach(bucket_id, "evidence", "alpha\n")
+    assert "detached" in await source_read(bucket_id, "evidence", source_slots=[1])
+    assert "active" in await source_restore(bucket_id, "evidence", 1)
+    assert "source_restore ok" in await source_restore(bucket_id, "evidence", 1)
+
+    after = await bucket_mgr.get(bucket_id)
+    assert [item["status"] for item in after["metadata"]["source_links"]] == ["active", "active", "active"]
+    assert [item["ref"] for item in after["metadata"]["source_refs"]] == [item["ref"] for item in after["metadata"]["source_links"]]
+    for field in ("content", "tags", "importance", "created", "last_active", "activation_count"):
+        if field == "content":
+            assert after[field] == before[field]
+        else:
+            assert after["metadata"][field] == before["metadata"][field]
+
+
+@pytest.mark.asyncio
+async def test_source_attach_preflights_access_before_publishing_blob(bucket_mgr, monkeypatch):
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "source_store", store)
+
+    bucket_id = await bucket_mgr.create("正文", title="精确标题")
+    assert "标题不匹配" in await source_attach(bucket_id, "错误标题", "不应落盘")
+    assert "未找到桶" in await source_attach("missing", "精确标题", "不应落盘")
+
+    locked_id = await bucket_mgr.create(
+        "信件正文",
+        title="锁定信件",
+        bucket_type="letter",
+        lock_type="permanent",
+        locked_by="human",
+    )
+    assert "拒绝" in await source_attach(locked_id, "锁定信件", "不应落盘")
+    assert not list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source"))
+
+
+@pytest.mark.asyncio
+async def test_source_links_are_immutable_shared_and_source_mutations_skip_indexing(
+    bucket_mgr, monkeypatch
+):
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "source_store", store)
+    index_after_update = AsyncMock()
+    monkeypatch.setattr(bucket_mgr, "_index_after_update", index_after_update)
+
+    first_id = await bucket_mgr.create("A", title="A")
+    second_id = await bucket_mgr.create("B", title="B")
+    # Ignore the two expected create-time index updates; this assertion is only
+    # about source binding mutations, which must bypass derived indexing.
+    index_after_update.reset_mock()
+    assert "slot=1" in await source_attach(first_id, "A", "shared\n")
+    assert "slot=1" in await source_attach(second_id, "B", "shared\n")
+    assert "slot=1" in await source_attach(first_id, "A", "shared\n")
+
+    first = await bucket_mgr.get(first_id)
+    second = await bucket_mgr.get(second_id)
+    assert first["metadata"]["source_links"][0]["ref"] == second["metadata"]["source_links"][0]["ref"]
+    assert len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source"))) == 1
+    assert await source_detach(first_id, "A", 1)
+    detached_manifest = await source_read(first_id, "A")
+    assert "source manifest" in detached_manifest and "slot=1" in detached_manifest and "detached" in detached_manifest
+    assert "shared" in await source_read(second_id, "B")
+    assert len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source"))) == 1
+    assert "active" in await source_restore(first_id, "A", 1)
+    assert index_after_update.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_source_links_support_legacy_projection_and_append_does_not_revive(
+    bucket_mgr, monkeypatch
+):
+    import frontmatter
+
+    store = SourceStore(bucket_mgr.base_dir)
+    ref = store.put("legacy\n")
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "source_store", store)
+    bucket_id = await bucket_mgr.create(
+        "正文", title="legacy", source_refs=[{"ref": ref, "ranges": [[1, 1]]}]
+    )
+    path = Path((await bucket_mgr.get(bucket_id))["path"])
+    post = frontmatter.load(path)
+    post.metadata.pop("source_links", None)
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    assert "legacy" in await source_read(bucket_id, "legacy")
+    assert "detached" in await source_detach(bucket_id, "legacy", 1)
+    assert await bucket_mgr.update(
+        bucket_id,
+        source_refs_append=[{"ref": ref, "ranges": [[1, 1]]}],
+    )
+    latest = await bucket_mgr.get(bucket_id)
+    assert latest["metadata"]["source_links"][0]["status"] == "detached"
+
+
+@pytest.mark.asyncio
+async def test_source_binding_operations_preserve_archived_and_locked_lifecycle(
+    bucket_mgr, monkeypatch
+):
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "source_store", store)
+
+    archived_id = await bucket_mgr.create("正文", title="归档证据")
+    assert await bucket_mgr.archive(archived_id)
+    before = await bucket_mgr.get_including_archive(archived_id)
+    assert before["metadata"]["type"] == "archived"
+    assert "slot=1" in await source_attach(archived_id, "归档证据", "archive\n")
+    assert "slot=1" in await source_detach(archived_id, "归档证据", 1)
+    assert "active" in await source_restore(archived_id, "归档证据", 1)
+    after = await bucket_mgr.get_including_archive(archived_id)
+    assert after["path"] == before["path"]
+    assert after["metadata"].get("type") == before["metadata"].get("type")
+    assert after["metadata"].get("deleted_at") == before["metadata"].get("deleted_at")
+
+    ref = store.put("locked\n")
+    locked_id = await bucket_mgr.create(
+        "信件正文",
+        title="锁定证据",
+        bucket_type="letter",
+        lock_type="permanent",
+        locked_by="human",
+        source_refs=[{"ref": ref, "ranges": [[1, 1]]}],
+    )
+    assert "拒绝" in await source_detach(locked_id, "锁定证据", 1)
+    assert "拒绝" in await source_restore(locked_id, "锁定证据", 1)
+
+
+def test_source_evidence_closure_unions_and_validates_both_metadata_fields():
+    first = "src_" + "1" * 64
+    second = "src_" + "2" * 64
+    markdown = (
+        "---\n"
+        f"source_refs:\n  - ref: {first}\n    ranges: []\n"
+        "source_links:\n"
+        f"  - ref: {second}\n    ranges: []\n    status: detached\n"
+        "---\nbody\n"
+    )
+    assert referenced_source_ids_from_markdown(markdown) == {first, second}
+
+    malformed = markdown.replace(first, "not-a-source-ref")
+    with pytest.raises(ValueError):
+        referenced_source_ids_from_markdown(malformed)
+
+
+@pytest.mark.asyncio
+async def test_source_binding_caps_reject_without_eviction(bucket_mgr, monkeypatch):
+    store = SourceStore(bucket_mgr.base_dir)
+    monkeypatch.setattr(rt, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(rt, "source_store", store)
+
+    active_id = await bucket_mgr.create("正文", title="活动上限")
+    for index in range(MAX_SOURCE_REFS):
+        assert "status=active" in await source_attach(
+            active_id, "活动上限", f"active-{index}\n"
+        )
+    source_files_before = len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source")))
+    rejected = await source_attach(active_id, "活动上限", "active-overflow\n")
+    assert "上限" in rejected
+    assert len((await bucket_mgr.get(active_id))["metadata"]["source_links"]) == MAX_SOURCE_REFS
+    assert len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source"))) == source_files_before
+
+    total_id = await bucket_mgr.create("正文", title="总量上限")
+    ref = store.put("cap\n")
+    links = [
+        {"ref": ref, "ranges": [[index, index]], "status": "detached"}
+        for index in range(1, MAX_SOURCE_LINKS + 1)
+    ]
+
+    def seed(post):
+        post["source_links"] = links
+        post["source_refs"] = []
+        return True, "seeded"
+
+    await bucket_mgr.mutate_source_links(total_id, seed)
+    source_files_before = len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source")))
+    rejected = await source_attach(total_id, "总量上限", "total-overflow\n")
+    assert "上限" in rejected
+    assert len((await bucket_mgr.get(total_id))["metadata"]["source_links"]) == MAX_SOURCE_LINKS
+    assert len(list((Path(bucket_mgr.base_dir) / "_sources").glob("*.source"))) == source_files_before
 
 
 @pytest.mark.asyncio

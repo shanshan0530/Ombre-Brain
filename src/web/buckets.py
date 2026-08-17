@@ -124,6 +124,10 @@ def register(mcp) -> None:
             )
         try:
             all_buckets = await sh.bucket_mgr.list_all(include_archive=True)
+            deletion_statuses = (
+                sh.deletion_requests.status_snapshot()
+                if sh.deletion_requests is not None else {}
+            )
             result = []
             for b in all_buckets:
                 meta = b.get("metadata", {})
@@ -184,6 +188,9 @@ def register(mcp) -> None:
                         isinstance(meta.get("provenance"), dict)
                         and meta["provenance"].get("kind") == "test"
                         and meta["provenance"].get("erasable") is True
+                    ),
+                    "deletion_request": (
+                        deletion_statuses.get(str(b["id"]))
                     ),
                 })
             if sort_mode == "score":
@@ -263,6 +270,10 @@ def register(mcp) -> None:
             "score": sh.decay_engine.calculate_score(meta),
             "triggered_feels": triggered_feels,  # iter 1.9 D
             "letter_locked": False,
+            "deletion_request": (
+                sh.deletion_requests.status(str(bucket["id"]))
+                if sh.deletion_requests is not None else None
+            ),
         })
 
 
@@ -464,17 +475,31 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}/archive", methods=["POST"])
     async def api_bucket_archive(request: Request) -> Response:
-        """Move bucket to archive directory (soft delete)."""
+        """Submit the single human archive request for a formal bucket.
+
+        Human-facing archive intentionally uses the delete-to-archive terminal
+        action: after AI approval the Markdown is retained in ``archive/`` and
+        receives ``deleted_at``. The lower-level ``bucket_mgr.archive()`` path
+        remains available to AI/system lifecycle code and keeps its distinct
+        non-tombstone semantics.
+        """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
             return err
         bucket_id = request.path_params["bucket_id"]
         try:
-            ok = await sh.bucket_mgr.archive(bucket_id)
-            if not ok:
-                return JSONResponse({"error": "archive failed or bucket not found"}, status_code=404)
-            return JSONResponse({"ok": True, "archived": True})
+            try:
+                body = await sh._read_json_object(request)
+            except Exception:
+                body = {}
+            result = await sh.deletion_requests.submit(
+                bucket_id, body.get("reason", ""), action="delete"
+            )
+            if result.get("ok"):
+                return JSONResponse(result)
+            status = 404 if result.get("code") == "not_found" else 409 if result.get("code") in {"pending_exists", "daily_limit", "lifetime_limit"} else 400
+            return JSONResponse(result, status_code=status)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -581,6 +606,12 @@ def register(mcp) -> None:
             return JSONResponse({"error": "invalid bucket id"}, status_code=400)
         if action not in {"forget", "resolve", "archive"}:
             return JSONResponse({"error": "unsupported batch action"}, status_code=400)
+        if action == "archive":
+            result = await sh.deletion_requests.submit_batch(
+                list(dict.fromkeys(ids)), body.get("reason", ""), action="delete"
+            )
+            status = 400 if result.get("code") == "reason_required" else 200
+            return JSONResponse({"action": action, **result}, status_code=status)
         updated, missing, errors = [], [], []
         for bucket_id in dict.fromkeys(ids):
             try:
@@ -592,8 +623,6 @@ def register(mcp) -> None:
                     ok = await sh.bucket_mgr.update(bucket_id, dont_surface=True)
                 elif action == "resolve":
                     ok = await sh.bucket_mgr.update(bucket_id, resolved=True)
-                else:
-                    ok = await sh.bucket_mgr.archive(bucket_id)
                 if ok:
                     updated.append(bucket_id)
                 else:
@@ -947,7 +976,7 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}", methods=["DELETE"])
     async def api_bucket_delete(request: Request) -> Response:
-        """Delete to archive (F-10): requires ?confirm=true. Moves file to archive/ + stamps deleted_at."""
+        """Submit a human deletion request for a formal bucket."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
@@ -956,12 +985,26 @@ def register(mcp) -> None:
             return JSONResponse({"error": "confirm=true required for delete-to-archive"}, status_code=400)
         bucket_id = request.path_params["bucket_id"]
         try:
-            ok = await sh.bucket_mgr.delete(bucket_id)
-            if not ok:
-                return JSONResponse({"error": "bucket not found"}, status_code=404)
-            return JSONResponse({"ok": True, "deleted": True})
+            try:
+                body = await sh._read_json_object(request)
+            except Exception:
+                body = {}
+            result = await sh.deletion_requests.submit(bucket_id, body.get("reason", ""))
+            if result.get("ok"):
+                return JSONResponse(result)
+            status = 404 if result.get("code") == "not_found" else 409 if result.get("code") in {"pending_exists", "daily_limit", "lifetime_limit"} else 400
+            return JSONResponse(result, status_code=status)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    @mcp.custom_route("/api/bucket/{bucket_id}/deletion-request/withdraw", methods=["POST"])
+    async def api_bucket_delete_withdraw(request: Request) -> Response:
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+        result = await sh.deletion_requests.withdraw(request.path_params["bucket_id"])
+        return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
 
     @mcp.custom_route("/api/buckets/purge", methods=["POST"])

@@ -16,8 +16,8 @@ tools/dream/hints.py — dream 的连接提示、结晶提示与 I 候选碰撞�
 关键行为：
 - 都依赖 embedding_engine.enabled；未启用时返回空串 / 空材料并明说
 - protected 只防衰减：连接、结晶、I 候选及碰撞材料一律不读取其正文
-- I 候选的选取并入 candidates.py 近期活跃段的同一套规则：48 小时窗口、
-  排除 pinned、排除 resolved（protected 排除单独保留）
+- I 候选不受普通近期窗口限制；否则候选一旦老于 window_hours，就再也无法
+  获得三次跨日见证。仍排除 pinned / resolved / protected
 - 任意异常都吞掉，只 warning，不影响 dream 主流程
 - 只读已落盘向量，不发新的 embedding 请求
 
@@ -33,9 +33,8 @@ tools/dream/hints.py — dream 的连接提示、结晶提示与 I 候选碰撞�
 
 from dataclasses import dataclass, field
 
-from ..i import I_PROMOTE_THRESHOLD, is_pending_candidate
+from ..i import I_PROMOTE_THRESHOLD, dream_dates, is_pending_candidate
 from .. import _runtime as rt
-from .candidates import is_within_window, recent_window_cutoff
 from ..plan.core import is_letter_bucket
 from utils import parse_bool, strip_wikilinks
 
@@ -142,8 +141,8 @@ class SelfCandidate:
 class SelfReview:
     """dream 里的 I 候选段。
 
-    ``rendered_ids`` 由 output.py 在实际渲染出某条候选后回写，dream 的
-    dispatch 只给这些候选记「被见证过一次」——没被看见的不算经历过。
+    ``rendered_ids`` 由 output.py 回写真正出现在最终文本中的候选（近期正文、
+    候选主块或碰撞材料），dream 的 dispatch 只给它们记「被见证过一次」。
     """
 
     candidates: list[SelfCandidate] = field(default_factory=list)
@@ -160,11 +159,11 @@ def _timestamp_key(bucket: dict) -> str:
 async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfReview:
     """收集待沉淀的 I 候选，并为每条取几条语义上最挨着的对照材料。
 
-    选取规则并入近期活跃段（candidates.py）的同一套 48 小时窗口、
-    排除 pinned、排除 resolved；protected 排除单独保留。
+    I 候选需要三次跨日见证才能升级，因此不能复用普通记忆的近期窗口；
+    否则过期候选会永久卡住。``window_hours`` 只约束普通 dream 记忆，保留
+    在参数中是为了维持调用契约。候选仍排除 pinned / resolved / protected。
     材料只是材料：支持、反驳、撞车都可能，这里不做任何判定。
     """
-    cutoff = recent_window_cutoff(window_hours)
     pending = [
         b for b in all_buckets
         if is_pending_candidate(b) and not is_letter_bucket(b)
@@ -173,7 +172,6 @@ async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfR
         )
         and not (b.get("metadata") or {}).get("pinned", False)
         and not (b.get("metadata") or {}).get("resolved", False)
-        and is_within_window(b.get("metadata") or {}, cutoff)
     ]
     if not pending:
         return SelfReview()
@@ -183,11 +181,7 @@ async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfR
         candidates=[
             SelfCandidate(
                 bucket=b,
-                passes=[
-                    str(d)[:10]
-                    for d in ((b.get("metadata") or {}).get("i_dream_dates") or [])
-                    if str(d).strip()
-                ],
+                passes=dream_dates(b.get("metadata") or {}),
             )
             for b in pending
         ]
@@ -205,6 +199,7 @@ async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfR
             if b["id"] not in pending_ids
             and not is_letter_bucket(b)
             and (b.get("metadata") or {}).get("type") == "i"
+            and not (b.get("metadata") or {}).get("pinned", False)
             and not parse_bool(
                 (b.get("metadata") or {}).get("protected"), default=False
             )
@@ -214,6 +209,7 @@ async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfR
             if b["id"] not in pending_ids
             and not is_letter_bucket(b)
             and (b.get("metadata") or {}).get("type") not in ("i", "letter")
+            and not (b.get("metadata") or {}).get("pinned", False)
             and not parse_bool(
                 (b.get("metadata") or {}).get("protected"), default=False
             )

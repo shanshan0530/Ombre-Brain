@@ -6,7 +6,7 @@ tools/_common.py — 跨工具共享的辅助逻辑
 这个文件收纳被多个工具同时复用的、与具体工具语义无关的小工具：
 配额检查（单桶字节上限 / pinned/protected 数量上限）、
 合并或新建（hold/grow 共用）、
-新桶疑似重复扫描、新事件触发的 plan 自动闭环判定。
+新桶疑似重复扫描、新事件触发的 plan 完成建议判定。
 
 关键行为：
 - check_content_size / check_pinned_quota / check_protected_quota：读取
@@ -16,8 +16,8 @@ tools/_common.py — 跨工具共享的辅助逻辑
 - iter 2.0：merge_or_create 接受 ``source_tool`` / ``grow_batch_id``，
   新建时写入 frontmatter；合并时不动原桶 source_tool，只追加 ``last_merged_by``
 - check_duplicate_for：fire-and-forget 标记疑似重复对（不自动合并）
-- check_plan_resolution：fire-and-forget 用关键词/向量双通道预筛 + LLM 保守判断
-  来把已完成的 active plan 标为 resolved
+- check_plan_resolution：fire-and-forget 用关键词/向量双通道预筛 + LLM 保守判断，
+  只记录可能已完成的建议，保留 active 状态等待显式确认
 
 不做什么（边界）：
 - 不持有任何全局对象，所有依赖都从 _runtime 取
@@ -41,7 +41,7 @@ import math
 import threading
 
 from bucket_manager import _filesystem_turn as _kernel_filesystem_turn
-from utils import normalize_memory_title, parse_bool
+from utils import normalize_memory_title, now_iso, parse_bool
 from ombrebrain.domain.plan_history import append_plan_change_log as append_plan_change_log
 
 from . import _runtime as rt
@@ -1324,7 +1324,7 @@ async def _rank_active_plans_by_query(
 
 
 async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "") -> None:
-    """新事件触发 active plan 关键词/向量召回，再由 LLM 保守判断是否闭环。"""
+    """新事件只检查检索命中的 active plan，并把 LLM 结果记录为建议。"""
     try:
         from .plan.core import is_letter_bucket
 
@@ -1354,7 +1354,7 @@ async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "")
         # 小模型调用数，避免 active plan 很多时一次写入触发无界 API 请求。
         plan_candidates = []
         seen_plan_ids: set[str] = set()
-        for candidate in keyword_candidates + vector_candidates + active_plans:
+        for candidate in keyword_candidates + vector_candidates:
             candidate_id = str(candidate.get("id") or "")
             if not candidate_id or candidate_id in seen_plan_ids:
                 continue
@@ -1367,15 +1367,21 @@ async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "")
                 judgement = await rt.dehydrator.judge_plan_resolution(
                     p["content"], new_event_text
                 )
-                if judgement.get("resolved") and judgement.get("confidence", 0.0) >= _PLAN_LLM_CONFIDENCE_MIN:
+                confidence = float(judgement.get("confidence") or 0.0)
+                if judgement.get("resolved") and confidence >= _PLAN_LLM_CONFIDENCE_MIN:
+                    reason = str(judgement.get("reason") or "")[:_RESOLUTION_REASON_MAX]
                     await rt.bucket_mgr.update(
                         p["id"],
-                        status="resolved",
-                        resolution_reason=judgement.get("reason", "")[:_RESOLUTION_REASON_MAX],
-                        resolved_by=source_bucket_id or "",
+                        resolution_suggested={
+                            "reason": reason,
+                            "confidence": confidence,
+                            "suggested_by": "plan_resolution_judge",
+                            "source_bucket_id": source_bucket_id or "",
+                            "ts": now_iso(),
+                        },
                     )
                     rt.logger.info(
-                        f"plan auto-resolved: {p['id']} — {judgement.get('reason', '')[:_LOG_REASON_PREVIEW]}"
+                        f"plan resolution suggested: {p['id']} — {reason[:_LOG_REASON_PREVIEW]}"
                     )
             except Exception as e:
                 rt.logger.warning(f"plan resolution judgement failed for {p['id']}: {e}")
@@ -1391,8 +1397,8 @@ async def check_plan_resolution(new_event_text: str, source_bucket_id: str = "")
 # 这是 rule.md §1 哲学落地：plan 是承诺，承诺被放下，承载这条承诺
 # 的事件桶也不该再浮上来。
 #
-# 不联动的路径：check_plan_resolution（LLM 自动二判）—— 自动判定
-# 的可信度低于人工/AI 显式动作，避免把活的事件桶意外打沉。
+# check_plan_resolution（LLM 自动二判）只写 resolution_suggested，
+# 不改变 plan status，因此也不会进入这条联动路径。
 #
 # 反向不做：bucket trace(resolved=1) 不联动 plan（plan 是独立承诺，
 # 单条事件结束不等于承诺达成）。

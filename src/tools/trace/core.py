@@ -622,14 +622,24 @@ async def trace_core(
             from .._common import append_plan_change_log
             old_meta = bucket.get("metadata", {})
             history = list(old_meta.get("change_log") or [])
-            if "status" in updates and updates["status"] != old_meta.get("status"):
+            old_status = old_meta.get("status") or "active"
+            if "status" in updates and updates["status"] != old_status:
                 history = append_plan_change_log(
                     history, "status",
-                    **{"from": old_meta.get("status"), "to": updates["status"]},
+                    **{
+                        "from": old_status,
+                        "to": updates["status"],
+                        "by": "trace",
+                    },
                 )
             if content_change_requested:
-                history = append_plan_change_log(history, "edit")
+                history = append_plan_change_log(history, "edit", by="trace")
             updates["change_log"] = history
+
+        if is_plan and ("status" in updates or content_change_requested):
+            # 显式状态/正文变更会让旧完成建议失效；None 由 BucketManager
+            # 解释为删除 frontmatter 字段。失败的局部替换不会进入提交路径。
+            updates["resolution_suggested"] = None
 
         if patch_args_supplied:
             patch_result = await rt.bucket_mgr.update_content_fragment(
@@ -694,7 +704,10 @@ async def trace_core(
 
     _display_updates = {
         k: v for k, v in updates.items()
-        if k not in ("content", "meaning_append", "meaning", "media_append", "media")
+        if k not in (
+            "content", "meaning_append", "meaning", "media_append", "media",
+            "resolution_suggested",
+        )
     }
     changed = ", ".join(f"{k}={v}" for k, v in _display_updates.items())
     if patch_args_supplied:

@@ -21,7 +21,10 @@ breath_search(query=...) 精准拉取需要的记忆——代替把全部记忆�
 
 from .. import _runtime as rt
 from ..plan.core import is_letter_bucket, letter_lock_state
+from ._verbatim import source_available_hint
+from ombrebrain.storage.relation_store import relation_hint
 from utils import parse_bool
+from errors import safe_error_detail
 
 # 类型 → (区头, 排序位)。未知类型归入动态区兜底。
 _SECTIONS = [
@@ -42,7 +45,7 @@ async def surface_catalog(
     try:
         buckets = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
-        return f"获取记忆目录失败: {e}"
+        return f"获取记忆目录失败: {safe_error_detail(e)}"
 
     if not buckets:
         return "记忆库为空。"
@@ -89,10 +92,22 @@ async def surface_catalog(
                 pin_mark = "🛡️ [受保护记忆] "
             elif parse_bool(meta.get("pinned"), default=False):
                 pin_mark = "📌"
+        anchor_mark = (
+            "⚓ [anchor] "
+            if parse_bool(meta.get("anchor"), default=False)
+            else ""
+        )
         line = (
-            f"{pin_mark}{name} | {','.join(domains) or '未分类'} | {imp} "
+            f"{pin_mark}{anchor_mark}{name} | {','.join(domains) or '未分类'} | {imp} "
             f"| {_footprint(b, meta)}"
         )
+        if not letter_locked:
+            source_hint = source_available_hint(b)
+            if source_hint:
+                line += f" | {source_hint}"
+            hint = relation_hint(b)
+            if hint:
+                line += f" | {hint.replace(chr(10), ' | ')}"
         btype = meta.get("type")
         key = "letter" if logical_letter else btype if btype in grouped else "dynamic"
         grouped[key].append((imp, line))

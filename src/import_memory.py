@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from errors import safe_error_detail
 from tools.plan.core import is_letter_bucket
 from utils import atomic_write_text, clean_llm_json, count_tokens_approx, now_iso, parse_bool
 
@@ -113,17 +114,12 @@ _IMPORT_ERROR_RULES = (
 
 
 def _safe_import_error_detail(exc: BaseException) -> str:
-    """Return a bounded provider error while redacting common credential forms."""
+    """导入侧的异常脱敏，实现已上移到 errors.safe_error_detail。
 
-    detail = str(exc).strip() or type(exc).__name__
-    detail = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[REDACTED]", detail)
-    detail = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[REDACTED]", detail)
-    detail = re.sub(
-        r"(?i)((?:api[_-]?key|token)\s*[=:]\s*)[^\s,;]+",
-        r"\1[REDACTED]",
-        detail,
-    )
-    return detail[:_CHUNK_ERR_PREVIEW]
+    保留这个名字是因为导入流水线内部已有多处调用（以及针对它的回归测试）；
+    真正的脱敏规则只维护 errors.py 一份，避免两处正则各自漂移。
+    """
+    return safe_error_detail(exc)
 
 
 def diagnose_import_errors(errors: list[object]) -> list[dict[str, str]]:
@@ -269,6 +265,13 @@ def _parse_structured_memory_json(
     marker_fields = {
         "name", "domain", "valence", "arousal", "tags", "importance"
     }
+    known_conversation_fields = {"chat_messages", "mapping", "messages"}
+    if not explicit_wrapper and any(
+        isinstance(item, dict)
+        and known_conversation_fields.intersection(item)
+        for item in candidates
+    ):
+        return None
     dictionary_items = all(
         isinstance(item, dict) and "role" not in item for item in candidates
     )

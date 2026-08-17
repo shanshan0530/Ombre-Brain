@@ -2,6 +2,196 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+### 未发布 / Unreleased
+
+- 修复 `grow` 在脱水拆分耗时超过 MCP/客户端等待时间时出现“前端报失败、服务端仍已写入”，随后重试又生成重复记忆的问题。首个任务不再随调用方断开而取消；同一请求在短时间内重试时会复用进行中的任务或已完成结果，不再重复写入。真实失败不会缓存，之后仍可正常重试。
+- Dashboard 普通桶详情合并「归档」与「删除到档案」的人类入口：现在只显示「归档」，要求填写理由并进入 AI 审批；批准后沿用删除到档案语义写入 `deleted_at`。AI/系统内部的普通 `archive()` 与自动衰减行为保持不变。
+
+## 2.17.11
+
+### 修复 / Fixed
+
+- Focus explicit recall questions on their actual topic.
+- Require topic relevance before recency/importance can admit memories.
+- Apply pinned/permanent bonus only after relevance admission.
+
+### 改进 / Changed
+
+- Relation MCP 可发现性补强：`relation_attach.relation_type` 直接以 schema enum 暴露六种固定类型与 `custom`，四个 Relation 工具的公开说明补齐 ID-first、方向语义、双向镜像、稳定 slot、detached/title 展开和 legacy 行为，避免调用方靠猜测参数。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.11`。
+
+## 2.17.10
+
+### 改进 / Changed
+
+- Relation 改为 ID-first 的天然双向关系：新建关系在两个普通桶各写一个共享 `relation_id` 的镜像视图，固定六型自动使用 `caused_by↔causes`、`continuation_of↔continues` 及两个对称类型的反向语义；新增 `custom` 类型，仅 custom 使用 `label/reverse_label`，未给 reverse 时默认沿用正向 label。
+- `expected_title` 从四个 Relation 工具的必填门槛降为可选校验；`relation_read` 默认只返回 active 的极简 ID ledger，可按需展开目标当前标题或 detached 历史。breath/dream/catalog 的 Relation hint 仍最多展示两条 active 关系，但现在会显式提示剩余条数。
+- 新双向 Relation 的 detach/restore 会在有序双桶锁内同步两端镜像；旧 V1 无 `relation_id` 的单向关系不批量迁移，继续保持可读、可原位 detach/restore 的兼容行为。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.10`。
+
+## 2.17.9
+
+### 修复 / Fixed
+
+- 修复 Claude `conversations.json` 被裸结构化记忆 JSON 预检误判的问题；带有
+  `chat_messages`、`mapping` 或 `messages` 的会话信封现在交由既有对话格式识别，
+  合法裸结构化记忆列表的直接导入兼容行为保持不变。
+
+### 测试 / Tests
+
+- 新增 Claude 官方 `chat_messages` 结构的预检回归测试，并保留裸结构化记忆列表测试。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.9`。
+
+## 2.17.8
+
+### 新增 / Added
+
+- 新增 Relation V1：普通记忆桶之间可建立一跳有向关系，使用稳定 1-based slot 的 `relation_links` ledger，并提供 `relation_attach`、`relation_read`、`relation_detach`、`relation_restore` 四个公开工具；detach/restore 可逆且不压缩 slot。
+- 内置六种机器关系 `caused_by` / `causes` / `continuation_of` / `continues` / `related_to` / `same_event`，默认显示为「原因 / 结果 / 前段 / 后续 / 相关 / 同一事件」；可选自定义 label 最多 20 字符，只改变展示语义，不新增 machine type。
+- breath 与 catalog 在已选中的普通桶后追加最多两条极简 Relation hint；dream 仅在近期普通记忆块展示 Relation。Relation 不读取目标标题或正文，也不参与候选生成、排序、embedding、activation、decay 或递归图遍历。
+
+### 兼容与安全 / Compatibility & Safety
+
+- Relation V1 仅连接普通记忆桶；归档普通桶仍保留并可管理关系，归档后的 plan / feel / I / letter 等特殊桶仍保持拒绝边界。
+- 备份导入的 keep_both 会重写包内 Relation 目标 ID；若包内目标未成功导入，则保留 stable slot 并原位 detached，避免误连到本地同 ID 旧桶。畸形 Relation metadata、非法 type、换行或超长 label 均 fail-closed。
+
+### 测试 / Tests
+
+- 扩展 Relation ledger、稳定 slot、方向性、自环、特殊桶、归档、active 上限、tiny manifest、breath/dream 渲染、公开 MCP schema 与 migration remap 回归；本地工程桥验证继续通过，Python/pytest 由 CI 执行权威验证。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.8`。
+
+## 2.17.7
+
+### 新增 / Added
+
+- 新增可逆的 Source 证据绑定层：持久化有序 `source_links`，并继续维护既有 `source_refs` 作为 active 兼容投影；同一 Source blob 可安全复用到多个桶，detach/restore 只改变绑定状态，不复制或改写原始证据。
+- 新增 `source_attach`、`source_detach`、`source_restore` 三个公开工具；slot 采用稳定的 1-based 位置，detach 后不压缩、不重排，restore 回到原 slot。
+- `source_read` 支持 `source_slots` 与 `all_sources`。多 Source 默认只返回极简 manifest，显式选择后才读取正文，避免一次拉取把上下文预算读满。
+
+### 兼容与安全 / Compatibility & Safety
+
+- 旧桶仅有 `source_refs` 时继续可读，并可按原顺序解释为 active links；新建/追加时同步维护两套字段。active 绑定上限保持 32，总 ledger 上限 128，超限显式拒绝，不静默丢弃。
+- Source attach/detach/restore 不改变桶正文、标签、domain、importance、生命周期、recency 或 embedding；归档桶可管理证据绑定，但不会借 Source restore 复活桶生命周期。锁定 Letter 继续拒绝 AI 修改。
+- 备份/迁移闭包同时收集 active 与 detached Source 引用，且在 `source_refs` / `source_links` 并存时取并集，防止证据遗漏。
+
+### 测试 / Tests
+
+- 扩展 Source 层、公开工具 schema、MCP 集成与服务器工具列表回归，覆盖共享不可变 Source、legacy 投影、稳定 slot、detach/restore 幂等、容量预检、单 detached manifest、备份闭包与不触发派生索引等边界。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.7`。
+
+## 2.17.6
+
+### 修复 / Fixed
+
+- 修复 `breath()` 无参浮现时的 pin 预算优先级：只要有任一核心准则因 token 预算不足无法整桶返回，本轮普通浮现、久未浮现与偶然想起全部跳过，避免普通记忆挤占核心准则预算。
+- 核心准则继续保持“整桶返回或整桶省略”，不截断、不摘要；当所有 pin 均能装入预算时，普通浮现原有排序、采样与预算行为保持不变。
+- 保持 breath 默认预算不变，仅将显式 `max_tokens` / `surfacing.breath_max_tokens` 的安全上限提高到 40000，为重度使用者提供 opt-in headroom。
+
+### 测试 / Tests
+
+- 新增回归覆盖 pin 被预算省略时普通记忆必须全部跳过，以及全部 pin 装入后普通记忆仍可正常返回；同时清理 `tests/test_dream_prompt_boundary.py` 中已知的 Ruff F841 无用变量。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.6`。
+
+## 2.17.5
+
+### 修复 / Fixed
+
+- 修复 I 候选在 `dream` 结果中已经浮现、见证数却仍停在 `0/3`：此前只统计
+  末尾专用候选段，候选若先在近期记忆段出现、而专用段被总 token 预算挤掉，
+  就会漏计。现在统一追踪最终输出中实际渲染的候选，无论它出现在近期记忆、
+  候选主块还是另一候选的碰撞材料，当天都记一次见证；完全未渲染仍不计次。
+- 候选状态或见证落盘返回失败时不再误报成功；历史 `i_dream_dates` 会按日期
+  去重后再判断 `promote` 的 3 次门槛，确保必须来自 3 个不同日期。
+
+### 测试 / Tests
+
+- 新增预算截断精确回归、碰撞材料见证、真实 Markdown 重载持久化、写入失败与
+  重复日期门槛测试，并补 MCP 端到端 `I → dream → I(read)` 见证链路。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.5`。
+
+## 2.17.4
+
+### 修复 / Fixed
+
+- 修正 2.17.3 引入的反向误导：`llm_step_failed_error()` 在 `api_available=True`
+  分支里写了「key 配置正常」。但 `api_available` 只回答「配没配」，不回答「配得
+  对不对」——key 填错、过期或余额耗尽时它仍是 True，调用会以 401/402 失败，这时
+  那句话等于把原来的误导换了个方向。真机用无效 key 跑 `grow` 复现后改成并列列出
+  可能原因（供应商故障、模型返回为空、key 失效或余额不足），把判断交回给日志。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.4`。
+
+## 2.17.3
+
+### 修复 / Fixed
+
+- `grow` 的两条路径（长文 digest、短内容打标）此前把所有失败都报成
+  「API key 未配置或调用失败，请检查 OMBRE_COMPRESS_API_KEY」。实际上这条路上
+  绝大多数失败与 key 无关——供应商 5xx、超时，或 dehydrator 抛的「API 日记整理
+  返回空结果」（模型返回解析后 0 条有效条目）都会撞上同一句话，把排查方向带偏：
+  key 明明是好的，失败前一秒调用还是 200。现在按 `dehydrator.api_available`
+  分岔，只有 API 确实没配好才提 `OMBRE_COMPRESS_API_KEY`，其余情况说明是调用
+  失败或返回为空，并引导去看 `server.log` 里的 `err_type`。
+- 工具层 9 处 `except Exception` 后直接把裸异常正文拼进返回值的位置，改走统一的
+  `errors.safe_error_detail()`：正文照给（保留排查线索），但先抹掉
+  `Bearer <token>`、`sk-` 开头的 key、`api_key=` / `token:` 这类键值对，并限长
+  200 字符。涉及 `i`、`plan`、`breath`、`anchor`、`grow` 五组工具。捕获自家校验器
+  `ValueError` 的那几处（`plan` 的 Letter 锁参数、`_common` 的 grow items 校验）
+  维持原样，那些是精心写给调用方的提示，不该被脱敏改写。
+
+### 变更 / Changed
+
+- 导入侧的 `_safe_import_error_detail()` 实现上移到 `errors.safe_error_detail()`，
+  原函数保留为薄封装以兼容既有调用与回归测试；脱敏正则只维护一份，避免两处漂移。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.3`。
+
+## 2.17.2
+
+### 修复 / Fixed
+
+- 完整落实 Issue #85：`grow(content=...)` 的长文 digest 与短内容快速路径会在
+  首次新建时保存合法的逐条 `why_remembered`；后续合并仍只补旧空值，绝不覆盖
+  人工或历史理由，空值和非法模型输出也不会阻断正文入库。
+- 按 Issue #89 的冷参考定位，为 `pulse()` 与 `breath_advanced(catalog=True)`
+  中的 anchor 桶增加独立 `⚓ [anchor]` 显示标记；不新增读取工具，不改变默认
+  `breath` / `dream` 的排除规则，也不改变显式检索、衰减或存储行为。
+- 补充 Issue #84 的历史格式回归：直接验证 `letters/history/` 中的 v2.4.12
+  Letter 在通用扫描、无参数 `letter_read()` 与 Dashboard Letter API 三个入口
+  一致可见，并覆盖活跃缓存预热后的外部文件变更检测。
+- 加固热更新清单生成：`VERSION`、`src/` 或 `frontend/` 仍有未暂存改动时
+  直接拒绝生成，并让清单版本与文件哈希统一读取同一 Git index/HEAD 快照，
+  防止再次产生 `src/VERSION` SHA-256 与源码归档不一致的发布包。
+
+### 版本 / Version
+
+- 根目录 `VERSION` 与 `src/VERSION` 同步更新为 `2.17.2`。
+
 ## 2.17.1
 
 ### 修复 / Fixed

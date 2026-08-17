@@ -2879,8 +2879,8 @@
         <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">0-100，越高越难合并相似桶</div>
         <div class="config-row"><label>breath 默认桶数</label><input type="number" id="cfg-sf-breath-results" min="1" max="50" /></div>
         <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">1-50。AI 调用 breath() 不指定 max_results 时使用此默认值</div>
-        <div class="config-row"><label>breath 默认 token</label><input type="number" id="cfg-sf-breath-tokens" min="500" max="20000" step="500" /></div>
-        <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">500-20000。breath 单次返回总 token 上限</div>
+        <div class="config-row"><label>breath 默认 token</label><input type="number" id="cfg-sf-breath-tokens" min="500" max="40000" step="500" /></div>
+        <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">500-40000。breath 单次返回总 token 上限；40000 为安全上限，不是默认值</div>
         <div class="config-row"><label>feel 历史 token</label><input type="number" id="cfg-sf-feel-tokens" min="500" max="20000" step="500" /></div>
         <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">500-20000。dream / breath(domain=feel) 中新 feel 的全文预算</div>
       </div>
@@ -4617,12 +4617,24 @@ function selectAllCurrentPage(checked) {
   syncBucketSelectionUi();
 }
 
+function isKnownErasableTestBucket(id) {
+  var bucket = (allBuckets || []).find(function(item) { return item.id === id; });
+  return !!(bucket && bucket.erasable_test_data);
+}
+
 async function runBucketBatch(action) {
   var ids = Array.from(selectedBucketIds);
   if (!ids.length) return alert('请先选择记忆桶。');
   var labels = {forget:'主动遗忘', resolve:'沉底', archive:'归档'};
   if (!confirm('确认对 ' + ids.length + ' 条记忆执行“' + labels[action] + '”？')) return;
-  var res = await authFetch('/api/buckets/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids, action:action})});
+  var reason = '';
+  var allKnownTests = ids.every(isKnownErasableTestBucket);
+  if (action === 'archive' && !allKnownTests) {
+    reason = prompt('Why should these memories be archived? A reason is required.');
+    if (reason === null) return;
+    if (!reason.trim()) return alert('Archive reason is required.');
+  }
+  var res = await authFetch('/api/buckets/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids, action:action, reason:reason})});
   if (!res) return;
   var data = await readJsonSafe(res);
   if (!res.ok) return alert(data.error || '批量操作失败');
@@ -5079,6 +5091,13 @@ async function showDetail(id) {
     var triggerHtml = meta.triggered_by ? ('<div class="field"><label>源 bucket</label><a href="#" data-bucket-id="' + escAttr(meta.triggered_by) + '" onclick="showDetail(this.dataset.bucketId);return false" style="color:var(--accent);text-decoration:underline;font-size:11px;">' + esc(meta.triggered_by) + ' →</a></div>') : '';
     // iter 1.9 D2: 反向链——这条触发了哪些 feel
     var triggeredFeelsHtml = '';
+    var deletionRequest = b.deletion_request || null;
+    var deletionRequestHtml = '';
+    if (deletionRequest && deletionRequest.status === 'pending') {
+      deletionRequestHtml = '<div style="margin:10px 0;padding:10px 14px;border-left:3px solid var(--negative);background:var(--surface-solid);">删除申请待 AI 决定 / Deletion pending: ' + esc(deletionRequest.human_reason || '') + ' <button data-bucket-id="' + escAttr(id) + '" onclick="withdrawBucketDeletion(this.dataset.bucketId)" class="icon-btn">撤回 / Withdraw</button></div>';
+    } else if (deletionRequest && deletionRequest.status === 'rejected') {
+      deletionRequestHtml = '<div style="margin:10px 0;padding:10px 14px;border-left:3px solid var(--accent);background:var(--surface-solid);">删除申请被拒绝 / Rejected' + (deletionRequest.ai_reason ? ': ' + esc(deletionRequest.ai_reason) : '') + '</div>';
+    }
     if (b.triggered_feels && b.triggered_feels.length) {
       triggeredFeelsHtml = '<div style="margin:14px 0;padding:10px 14px;border-left:3px solid var(--accent);background:var(--surface-solid);">' +
         '<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">这条触发了 ' + b.triggered_feels.length + ' 条 feel：</div>' +
@@ -5114,13 +5133,13 @@ async function showDetail(id) {
         triggerHtml +
       '</div>' +
       triggeredFeelsHtml +
+      deletionRequestHtml +
       '<div class="detail-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;">' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketPin(this.dataset.bucketId)" class="icon-btn">' + (meta.pinned ? '<i data-lucide="pin-off"></i> 取消钉选' : '<i data-lucide="pin"></i> 钉选') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketAnchor(this.dataset.bucketId)" class="icon-btn" title="anchor = 坐标系，不主动浮现，硬上限 24">' + (meta.anchor ? '<i data-lucide="anchor"></i> 释放 anchor' : '<i data-lucide="anchor"></i> 设为 anchor') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketResolve(this.dataset.bucketId)" class="icon-btn">' + (meta.resolved ? '<i data-lucide="rotate-ccw"></i> 取消已解决' : '<i data-lucide="check"></i> 标记已解决') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketForget(this.dataset.bucketId)" class="icon-btn">' + (meta.dont_surface ? '<i data-lucide="eye"></i> 重新允许浮现' : '<i data-lucide="eye-off"></i> 主动遗忘') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketArchive(this.dataset.bucketId)" class="icon-btn"><i data-lucide="archive"></i> 归档</button>' +
-        '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketDelete(this.dataset.bucketId)" class="icon-btn" style="color:#b85c3c;"><i data-lucide="trash-2"></i> 删除到档案</button>' +
       '</div>' +
       '<div class="detail-content">' + esc(displayContent) + '</div>' +
       renderEditForm(id, Object.assign({}, meta, {_content_for_edit: b.content}));
@@ -5241,27 +5260,27 @@ async function bucketResolve(id) {
 }
 
 async function bucketArchive(id) {
-  if (!confirm('确认归档此桶？归档后将从浮现/搜索中隐藏，但文件仍保留在 archive/ 目录。\n\nArchive this bucket? It will be hidden from surfacing/search, but the file stays in archive/.')) return;
+  if (!confirm('确认申请归档此桶？需填写理由并由 AI 审批；批准后它将从浮现/搜索中隐藏，文件仍保留在 archive/ 目录并标记为已删除。\n\nRequest archive? AI approval is required. The file remains in archive/ with a deletion marker.')) return;
+  var reason = '';
+  if (!isKnownErasableTestBucket(id)) {
+    reason = prompt('为什么要归档这条记忆？必须填写理由，由 AI 审批。 / Why should this memory be archived? AI approval is required.');
+    if (reason === null) return;
+    if (!reason.trim()) { alert('Archive reason is required.'); return; }
+  }
   try {
-    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/archive', { method: 'POST' });
+    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/archive', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({reason: reason}) });
     if (!res.ok) throw new Error(await res.text());
     closeDetail();
     loadBuckets();
   } catch (e) { alert('归档失败: ' + e.message); }
 }
 
-async function bucketDelete(id) {
-  if (!confirm('这会把此记忆桶移入删除档案，并从日常界面隐藏；文件仍保留在 archive/ 中。继续？\n\nThis moves the bucket to the delete archive and hides it from everyday views; the file stays in archive/. Continue?')) return;
+async function withdrawBucketDeletion(id) {
   try {
-    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE' });
+    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/deletion-request/withdraw', {method:'POST'});
     if (!res.ok) throw new Error(await res.text());
-    closeDetail();
-    // 「放下」：让这条记忆轻轻消散，而不是直接消失
-    var sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
-    var row = document.querySelector('.bucket-row[data-id="' + sel + '"]');
-    if (row) { row.classList.add('dissolving'); setTimeout(loadBuckets, 600); }
-    else { loadBuckets(); }
-  } catch (e) { alert('删除失败: ' + e.message); }
+    await showDetail(id); loadBuckets();
+  } catch (e) { alert('撤回失败 / Withdrawal failed: ' + e.message); }
 }
 
 function closeDetail() {
@@ -8440,9 +8459,15 @@ async function detectPatterns() {
 
 async function reviewAction(bid, action) {
   try {
+    var reason = '';
+    if (action === 'delete') {
+      reason = prompt('为什么要删除这条记忆？必须填写理由。 / Why should this memory be deleted?');
+      if (reason === null) return;
+      if (!reason.trim()) throw new Error('Deletion reason is required.');
+    }
     const response = await fetch(BASE + '/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
+      body: JSON.stringify({ decisions: [{ bucket_id: bid, action, reason }] })
     });
     const result = await readJsonSafe(response);
     if (!response.ok || !result || result.applied !== 1 || result.errors) {
@@ -9490,12 +9515,14 @@ function _renderLetter(l) {
       <span style="color:${accentColor};font-weight:600;">${esc(who)}</span><span>${esc(l.date || '')}</span>
     </div>
     <div style="font-size:11px;color:${l.locked ? 'var(--accent)' : 'var(--text-dim)'};margin-bottom:8px;">${lockLabel}</div>
+    ${l.deletion_request && l.deletion_request.status === 'pending' ? `<div style="font-size:12px;color:var(--negative);margin-bottom:8px;">删除申请待决定 / Deletion pending: ${esc(l.deletion_request.human_reason || '')}</div>` : ''}
+    ${l.deletion_request && l.deletion_request.status === 'rejected' ? `<div style="font-size:12px;color:var(--accent);margin-bottom:8px;">删除申请被拒绝 / Rejected${l.deletion_request.ai_reason ? ': ' + esc(l.deletion_request.ai_reason) : ''}</div>` : ''}
     ${l.locked ? '<div style="font-size:13px;color:var(--text-dim);padding:10px 0;">这封信尚未向你开放。</div>' : `${l.title ? `<div style="font-family:'Cormorant Garamond', serif;font-size:17px;font-weight:600;margin-bottom:8px;color:var(--text);">${esc(l.title)}</div>` : ''}<div style="white-space:pre-wrap;font-size:14px;line-height:1.75;color:var(--text);">${esc(l.content || '')}</div>`}
     <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;font-size:11px;">
       ${!l.locked ? `<button data-letter-id="${escAttr(l.id)}" onclick="editLetter(this.dataset.letterId)" title="编辑" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="pencil" style="width:13px;height:13px;"></i></button>` : ''}
       ${l.lock_owner ? `<button data-letter-id="${escAttr(l.id)}" onclick="manageLetterLock(this.dataset.letterId)" title="修改锁状态" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="lock-keyhole" style="width:13px;height:13px;"></i> 锁</button>` : ''}
       ${l.lock_upgrade_available ? `<button data-letter-id="${escAttr(l.id)}" onclick="convertLegacyLetter(this.dataset.letterId)" title="转换为 AI 可管理锁的新格式" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="refresh-cw" style="width:13px;height:13px;"></i> 转换</button>` : ''}
-      <button data-letter-id="${escAttr(l.id)}" onclick="deleteLetter(this.dataset.letterId)" title="删除" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:13px;height:13px;"></i></button>
+      ${l.deletion_request && l.deletion_request.status === 'pending' ? `<button data-letter-id="${escAttr(l.id)}" onclick="withdrawLetterDeletion(this.dataset.letterId)" title="撤回删除申请">撤回 / Withdraw</button>` : `<button data-letter-id="${escAttr(l.id)}" onclick="deleteLetter(this.dataset.letterId)" title="删除" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:13px;height:13px;"></i></button>`}
     </div>
   </article>`;
 }
@@ -9601,14 +9628,23 @@ async function manageLetterLock(id) {
 }
 
 async function deleteLetter(id) {
-  if (!confirm('这会把这封信移入删除档案；文件仍保留在 archive/ 中。继续？\n\nThis moves the letter to the delete archive; the file stays in archive/. Continue?')) return;
-  if (!confirm('再次确认：这不是物理抹除。 / Confirm again: this is not a physical erase.')) return;
+  const reason = prompt('为什么要删除这封信？必须填写理由。 / Why should this letter be deleted?');
+  if (reason === null) return;
+  if (!reason.trim()) { alert('必须填写删除理由。 / Deletion reason is required.'); return; }
   try {
-    const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE' });
+    const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({reason}) });
     const d = await r.json();
-    if (d.ok) { alert('已删除到档案 / Moved to archive'); loadLetters(); }
+    if (d.ok) { alert(d.deleted ? '已移入档案 / Moved to archive' : '删除申请已提交 / Deletion request submitted'); loadLetters(); }
     else { alert(d.error || '删除失败'); }
   } catch (e) { alert(e.message); }
+}
+
+async function withdrawLetterDeletion(id) {
+  try {
+    const r = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/deletion-request/withdraw', {method:'POST'});
+    if (!r.ok) throw new Error(await r.text());
+    loadLetters();
+  } catch (e) { alert('撤回失败 / Withdrawal failed: ' + e.message); }
 }
 
 // ── E/F 级错误自动弹窗 ────────────────────────────────────────

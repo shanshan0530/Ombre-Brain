@@ -31,6 +31,13 @@ EXPECTED_TOOLS = {
     "hold",
     "grow",
     "source_read",
+    "source_attach",
+    "source_detach",
+    "source_restore",
+    "relation_read",
+    "relation_attach",
+    "relation_detach",
+    "relation_restore",
     "trace",
     "anchor",
     "release",
@@ -49,6 +56,13 @@ EXPECTED_TOOL_ORDER = (
     "hold",
     "grow",
     "source_read",
+    "source_attach",
+    "source_detach",
+    "source_restore",
+    "relation_read",
+    "relation_attach",
+    "relation_detach",
+    "relation_restore",
     "trace",
     "dream",
     "anchor",
@@ -91,9 +105,19 @@ EXPECTED_TOOL_PROPERTIES = {
         "meaning",
         "media",
         "test_data",
+        "domain",
+        "source_content",
+        "source_ranges",
     },
-    "grow": {"content", "items"},
-    "source_read": {"bucket_id", "expected_title", "scope", "cursor", "max_tokens"},
+    "grow": {"content", "items", "test_data"},
+    "source_read": {"bucket_id", "expected_title", "scope", "cursor", "max_tokens", "source_slots", "all_sources"},
+    "source_attach": {"bucket_id", "expected_title", "source_content", "source_ranges"},
+    "source_detach": {"bucket_id", "expected_title", "source_slot"},
+    "source_restore": {"bucket_id", "expected_title", "source_slot"},
+    "relation_read": {"bucket_id", "expected_title", "include_titles", "include_detached"},
+    "relation_attach": {"bucket_id", "target_bucket_id", "relation_type", "expected_title", "label", "reverse_label"},
+    "relation_detach": {"bucket_id", "relation_slot", "expected_title"},
+    "relation_restore": {"bucket_id", "relation_slot", "expected_title"},
     "trace": {
         "bucket_id",
         "name",
@@ -121,6 +145,9 @@ EXPECTED_TOOL_PROPERTIES = {
         "restore",
         "old_str",
         "new_str",
+        "deletion_request_id",
+        "deletion_decision",
+        "deletion_ai_reason",
     },
     "anchor": {"bucket_id"},
     "release": {"bucket_id"},
@@ -140,6 +167,13 @@ EXPECTED_REQUIRED_PROPERTIES = {
     "breath_search": {"query"},
     "hold": {"content"},
     "source_read": {"bucket_id", "expected_title"},
+    "source_attach": {"bucket_id", "expected_title", "source_content"},
+    "source_detach": {"bucket_id", "expected_title", "source_slot"},
+    "source_restore": {"bucket_id", "expected_title", "source_slot"},
+    "relation_read": {"bucket_id"},
+    "relation_attach": {"bucket_id", "target_bucket_id", "relation_type"},
+    "relation_detach": {"bucket_id", "relation_slot"},
+    "relation_restore": {"bucket_id", "relation_slot"},
     "trace": {"bucket_id"},
     "anchor": {"bucket_id"},
     "release": {"bucket_id"},
@@ -274,6 +308,15 @@ def _bucket_ids(text: str) -> set[str]:
     return set(re.findall(r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])", text))
 
 
+def _i_witness_progress(text: str, bucket_id: str) -> tuple[int, int]:
+    match = re.search(
+        rf"{re.escape(bucket_id)}\s+（(\d+)/(\d+) 次 dream）",
+        text,
+    )
+    assert match, text
+    return int(match.group(1)), int(match.group(2))
+
+
 def _hold(mcp_client: MCPClient, marker: str, **overrides) -> str:
     arguments = {"content": marker, "tags": "docker,mcp", "importance": 7}
     arguments.update(overrides)
@@ -319,7 +362,7 @@ def test_concurrent_clients_discover_the_same_stateless_dream_schema():
     assert set(schemas[0]["properties"]) == {"window_hours"}
 
 
-def test_manifest_exposes_exactly_the_documented_15_tools(mcp_client):
+def test_manifest_exposes_exactly_the_documented_23_tools(mcp_client):
     tools = mcp_client.list_tools()
     assert [tool["name"] for tool in tools] == list(EXPECTED_TOOL_ORDER)
     tools_by_name = {tool["name"]: tool for tool in tools}
@@ -337,6 +380,34 @@ def test_manifest_exposes_exactly_the_documented_15_tools(mcp_client):
     # Runtime compatibility with the old 9-argument schema is tested separately.
     assert tools_by_name["breath"]["inputSchema"].get("properties") == {}
 
+    relation_types = [
+        "caused_by",
+        "causes",
+        "continuation_of",
+        "continues",
+        "related_to",
+        "same_event",
+        "custom",
+    ]
+    relation_attach = tools_by_name["relation_attach"]
+    assert relation_attach["inputSchema"]["properties"]["relation_type"]["enum"] == relation_types
+    assert "bucket_id -> target_bucket_id" in relation_attach["description"]
+    assert all(name in relation_attach["description"] for name in relation_types)
+    assert "reverse_label" in relation_attach["description"]
+
+    relation_read = tools_by_name["relation_read"]
+    assert "include_detached=True" in relation_read["description"]
+    assert "include_titles=True" in relation_read["description"]
+    assert "不读取目标正文" in relation_read["description"]
+
+    relation_detach = tools_by_name["relation_detach"]
+    assert "不删除关系历史" in relation_detach["description"]
+    assert "relation_id" in relation_detach["description"]
+
+    relation_restore = tools_by_name["relation_restore"]
+    assert "relation_id" in relation_restore["description"]
+    assert "archived" in relation_restore["description"]
+
 
 @pytest.mark.parametrize(
     ("tool", "arguments", "field"),
@@ -347,6 +418,13 @@ def test_manifest_exposes_exactly_the_documented_15_tools(mcp_client):
         ("hold", {}, "content"),
         ("grow", {"items": {"not": "a list"}}, "items"),
         ("source_read", {}, "bucket_id"),
+        ("source_attach", {}, "bucket_id"),
+        ("source_detach", {}, "bucket_id"),
+        ("source_restore", {}, "bucket_id"),
+        ("relation_read", {}, "bucket_id"),
+        ("relation_attach", {}, "bucket_id"),
+        ("relation_detach", {}, "bucket_id"),
+        ("relation_restore", {}, "bucket_id"),
         ("trace", {}, "bucket_id"),
         ("anchor", {}, "bucket_id"),
         ("release", {}, "bucket_id"),
@@ -375,6 +453,13 @@ def test_all_tools_reject_schema_invalid_arguments(mcp_client, tool, arguments, 
         ("hold", {"content": "unknown-field-probe", "test_data": True}),
         ("grow", {"items": []}),
         ("source_read", {"bucket_id": "unknown", "expected_title": "unknown"}),
+        ("source_attach", {"bucket_id": "unknown", "expected_title": "unknown", "source_content": "probe"}),
+        ("source_detach", {"bucket_id": "unknown", "expected_title": "unknown", "source_slot": 1}),
+        ("source_restore", {"bucket_id": "unknown", "expected_title": "unknown", "source_slot": 1}),
+        ("relation_read", {"bucket_id": "unknown", "expected_title": "unknown"}),
+        ("relation_attach", {"bucket_id": "unknown", "expected_title": "unknown", "target_bucket_id": "target", "relation_type": "related_to"}),
+        ("relation_detach", {"bucket_id": "unknown", "expected_title": "unknown", "relation_slot": 1}),
+        ("relation_restore", {"bucket_id": "unknown", "expected_title": "unknown", "relation_slot": 1}),
         ("trace", {"bucket_id": "missing-unknown-field-probe"}),
         ("anchor", {"bucket_id": "missing-unknown-field-probe"}),
         ("release", {"bucket_id": "missing-unknown-field-probe"}),
@@ -784,9 +869,8 @@ def test_letter_time_lock_write_read_and_owner_unlock_in_real_container(mcp_clie
             "lock_type": "permanent",
         },
     )
-    receipt = json.loads(written)
-    assert receipt["stored"] is True
-    assert receipt["lock_type"] == "permanent"
+    letter_id = _bucket_id(written)
+    assert "🔒permanent" in written
     assert marker not in written and title not in written
 
     owner_read = mcp_client.call(
@@ -794,12 +878,13 @@ def test_letter_time_lock_write_read_and_owner_unlock_in_real_container(mcp_clie
     )
     assert marker in owner_read and title in owner_read
 
-    updated = json.loads(mcp_client.call(
+    updated = mcp_client.call(
         "letter_lock_update",
-        {"letter_id": receipt["letter_id"], "lock_type": "none"},
-    ))
-    assert updated["updated"] is True
-    assert updated["lock_type"] == "none"
+        {"letter_id": letter_id, "lock_type": "none"},
+    )
+    assert updated.startswith("🔓")
+    assert letter_id in updated
+    assert "默认可读" in updated
 
 
 def test_I_writes_and_reads_pending_self_description(mcp_client):
@@ -811,6 +896,27 @@ def test_I_writes_and_reads_pending_self_description(mcp_client):
     read_back = mcp_client.call("I", {"read": True, "limit": 20})
     assert "=== 正在沉淀的「我觉得」" in read_back
     assert marker in read_back
+
+
+def test_I_candidate_visible_in_dream_advances_one_witness(mcp_client):
+    marker = _marker("i-dream-witness")
+    written = mcp_client.call(
+        "I",
+        {"content": marker, "aspect": "patterns"},
+    )
+    candidate_id = _bucket_id(written)
+
+    before = mcp_client.call("I", {"read": True, "limit": 100})
+    assert marker in before
+    assert _i_witness_progress(before, candidate_id) == (0, 3)
+
+    dreamed = mcp_client.call("dream", {"window_hours": 48})
+    assert marker in dreamed
+    assert candidate_id in dreamed
+
+    after = mcp_client.call("I", {"read": True, "limit": 100})
+    assert marker in after
+    assert _i_witness_progress(after, candidate_id) == (1, 3)
 
 
 def test_dream_returns_recent_complete_memory(mcp_client):

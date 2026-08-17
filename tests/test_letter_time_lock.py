@@ -44,6 +44,11 @@ def created_id(result):
     return result.split("→", 1)[1].split(" ", 1)[0]
 
 
+def assert_lock_update_succeeded(result, letter_id, lock_type):
+    assert letter_id in result
+    assert result.startswith("🔓" if lock_type == "none" else "🔒")
+
+
 @pytest.mark.asyncio
 async def test_old_and_none_letters_remain_readable_and_proxy_write_compatible(bucket_mgr):
     install_runtime(bucket_mgr)
@@ -73,8 +78,7 @@ async def test_mcp_creates_locked_letter_owned_by_ai_without_echoing_content(
         lock_type=lock_type,
         unlock_date=unlock if lock_type == "timed" else "",
     )
-    data = json.loads(result)
-    bucket = await bucket_mgr.get(data["letter_id"])
+    bucket = await bucket_mgr.get(created_id(result))
 
     assert "secret" not in result
     assert bucket["metadata"]["locked_by"] == "ai"
@@ -134,10 +138,18 @@ async def test_lock_owner_can_change_every_supported_transition_without_editing_
     original = await bucket_mgr.get(letter_id)
     future = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
 
-    assert json.loads(await letter_lock_update(letter_id, "timed", future))["updated"] is True
-    assert json.loads(await letter_lock_update(letter_id, "permanent"))["updated"] is True
-    assert json.loads(await letter_lock_update(letter_id, "none"))["updated"] is True
-    assert json.loads(await letter_lock_update(letter_id, "timed", future))["updated"] is True
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "timed", future), letter_id, "timed"
+    )
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "permanent"), letter_id, "permanent"
+    )
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "none"), letter_id, "none"
+    )
+    assert_lock_update_succeeded(
+        await letter_lock_update(letter_id, "timed", future), letter_id, "timed"
+    )
     current = await bucket_mgr.get(letter_id)
     assert current["content"] == original["content"]
     for field in ("title", "author", "created"):
@@ -429,8 +441,8 @@ async def test_ai_owner_can_relock_public_letter_through_multiple_cycles(
         ("timed", future),
     ]
     for lock_type, unlock_date in transitions:
-        result = json.loads(await letter_lock_update(letter_id, lock_type, unlock_date))
-        assert result["updated"] is True
+        result = await letter_lock_update(letter_id, lock_type, unlock_date)
+        assert_lock_update_succeeded(result, letter_id, lock_type)
         current = await bucket_mgr.get(letter_id)
         assert current["metadata"]["locked_by"] == "ai"
         assert current["metadata"]["writer_name"] == "张三"
@@ -461,8 +473,8 @@ async def test_expired_timed_letter_keeps_owner_and_can_be_locked_again(
     assert expired["metadata"]["writer_name"] == "张三"
 
     future = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
-    relocked = json.loads(await letter_lock_update(letter_id, "timed", future))
-    assert relocked["updated"] is True
+    relocked = await letter_lock_update(letter_id, "timed", future)
+    assert_lock_update_succeeded(relocked, letter_id, "timed")
     current = await bucket_mgr.get(letter_id)
     assert current["metadata"]["lock_type"] == "timed"
     assert current["metadata"]["locked_by"] == "ai"
@@ -598,8 +610,8 @@ async def test_dashboard_converts_historical_letter_to_ai_owned_lockable_format(
     assert (await patch(JsonRequest({"lock_type": "permanent"}, historical_id))).status_code == 403
 
     install_runtime(bucket_mgr)
-    relocked = json.loads(await letter_lock_update(historical_id, "permanent"))
-    assert relocked["updated"] is True
+    relocked = await letter_lock_update(historical_id, "permanent")
+    assert_lock_update_succeeded(relocked, historical_id, "permanent")
     assert (await bucket_mgr.get(historical_id))["metadata"]["locked_by"] == "ai"
 
 

@@ -166,6 +166,126 @@ async def test_plan_edit_rejects_oversized_content_without_updating(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_plan_api_uses_canonical_created_and_last_active(monkeypatch):
+    class BucketManager:
+        async def list_all(self, include_archive=False):
+            assert include_archive is False
+            return [{
+                "id": "plan-1",
+                "content": "计划正文",
+                "metadata": {
+                    "type": "plan",
+                    "status": "active",
+                    "created": "2026-08-12T10:00:00",
+                    "last_active": "2026-08-12T11:00:00",
+                },
+            }]
+
+    monkeypatch.setattr(plans_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(plans_web.sh, "bucket_mgr", BucketManager(), raising=False)
+    mcp = FakeMCP()
+    plans_web.register(mcp)
+
+    response = await mcp.routes[("GET", "/api/plans")](JsonRequest())
+    plan = _json(response)["active"][0]
+
+    assert plan["created_at"] == "2026-08-12T10:00:00"
+    assert plan["updated_at"] == "2026-08-12T11:00:00"
+
+
+@pytest.mark.asyncio
+async def test_plan_dashboard_status_change_records_actor(monkeypatch):
+    class BucketManager:
+        def __init__(self):
+            self.updates = []
+
+        async def get(self, bucket_id):
+            return {
+                "id": bucket_id,
+                "content": "计划正文",
+                "metadata": {
+                    "type": "plan",
+                    "status": "active",
+                    "change_log": [],
+                    "resolution_suggested": {
+                        "reason": "计划可能已完成",
+                        "ts": "2026-08-12T12:00:00",
+                    },
+                },
+            }
+
+        async def update(self, bucket_id, **updates):
+            self.updates.append((bucket_id, updates))
+            return True
+
+    manager = BucketManager()
+    monkeypatch.setattr(plans_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(plans_web.sh, "bucket_mgr", manager, raising=False)
+    mcp = FakeMCP()
+    plans_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/plans/{bucket_id}/action")](
+        JsonRequest({"action": "resolve"}, path_params={"bucket_id": "plan-1"})
+    )
+
+    assert response.status_code == 200
+    _, updates = manager.updates[0]
+    entry = updates["change_log"][-1]
+    assert entry["action"] == "status"
+    assert entry["from"] == "active"
+    assert entry["to"] == "resolved"
+    assert entry["by"] == "dashboard"
+    assert entry["ts"]
+    assert updates["resolution_suggested"] is None
+
+
+@pytest.mark.asyncio
+async def test_plan_dashboard_edit_clears_resolution_suggestion(monkeypatch):
+    class BucketManager:
+        def __init__(self):
+            self.updates = []
+
+        async def get(self, bucket_id):
+            return {
+                "id": bucket_id,
+                "content": "旧计划正文",
+                "metadata": {
+                    "type": "plan",
+                    "status": "active",
+                    "change_log": [],
+                    "resolution_suggested": {
+                        "reason": "旧正文可能已完成",
+                        "ts": "2026-08-12T12:00:00",
+                    },
+                },
+            }
+
+        async def update(self, bucket_id, **updates):
+            self.updates.append((bucket_id, updates))
+            return True
+
+    manager = BucketManager()
+    monkeypatch.setattr(plans_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(plans_web.sh, "bucket_mgr", manager, raising=False)
+    mcp = FakeMCP()
+    plans_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/plans/{bucket_id}/action")](
+        JsonRequest(
+            {"action": "edit", "content": "新计划正文"},
+            path_params={"bucket_id": "plan-1"},
+        )
+    )
+
+    assert response.status_code == 200
+    _, updates = manager.updates[0]
+    assert updates["content"] == "新计划正文"
+    assert updates["resolution_suggested"] is None
+    assert updates["change_log"][-1]["action"] == "edit"
+    assert updates["change_log"][-1]["by"] == "dashboard"
+
+
+@pytest.mark.asyncio
 async def test_ollama_pull_bounds_connection_waits_but_allows_long_stream(monkeypatch):
     captured = {}
 

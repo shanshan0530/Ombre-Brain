@@ -521,6 +521,12 @@ class BucketManager:
         self.plan_dir = os.path.join(self.base_dir, "plans")
         self.letter_dir = os.path.join(self.base_dir, "letters")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
+        self.topic_relevance_min = float(
+            config.get("matching", {}).get("topic_relevance_min", 0.08)
+        )
+        self.pinned_relevance_bonus = float(
+            config.get("matching", {}).get("pinned_relevance_bonus", 5.0)
+        )
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
         # --- Search scoring weights / 检索权重配置 ---
@@ -1538,7 +1544,10 @@ class BucketManager:
                     str(writer_name)
                 ).strip()[:120]
         if source_refs:
-            metadata["source_refs"] = source_refs
+            from ombrebrain.storage.source_store import source_links_from_metadata, active_source_refs_from_links
+
+            metadata["source_links"] = source_links_from_metadata({"source_refs": source_refs})
+            metadata["source_refs"] = active_source_refs_from_links(metadata["source_links"])
         if imported:
             metadata["imported"] = True
         if test_data:
@@ -2135,13 +2144,20 @@ class BucketManager:
             updates = dict(kwargs)
             if append_plan_history and str(post.get("type") or "") == "plan":
                 history = list(post.get("change_log") or [])
-                if "status" in updates and updates["status"] != post.get("status"):
+                old_status = post.get("status") or "active"
+                if "status" in updates and updates["status"] != old_status:
                     history = append_plan_change_log(
                         history,
                         "status",
-                        **{"from": post.get("status"), "to": updates["status"]},
+                        **{
+                            "from": old_status,
+                            "to": updates["status"],
+                            "by": event_actor,
+                        },
                     )
-                updates["change_log"] = append_plan_change_log(history, "edit")
+                updates["change_log"] = append_plan_change_log(
+                    history, "edit", by=event_actor
+                )
             updates["content"] = updated_content
             try:
                 committed = await self._update_locked(
@@ -2217,6 +2233,96 @@ class BucketManager:
                 meaning_changed=meaning_changed,
             )
         return committed
+
+    async def mutate_source_links(self, bucket_id: str, mutation: Any) -> Any:
+        """Atomically change evidence bindings only, including archived buckets.
+
+        The callback receives the loaded frontmatter post and returns
+        ``(changed, result)``.  This deliberately bypasses normal update()
+        lifecycle/recency behaviour while retaining the per-bucket write turn.
+        """
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return None
+            try:
+                post = frontmatter.load(file_path)
+            except Exception:
+                return None
+            changed, result = mutation(post)
+            if changed:
+                _atomic_write_text(file_path, frontmatter.dumps(post))
+            return result
+
+    async def mutate_relation_links(self, bucket_id: str, mutation: Any) -> Any:
+        """Atomically change one Relation ledger only; never touch derived state."""
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return None
+            try:
+                post = frontmatter.load(file_path)
+            except Exception:
+                return None
+            changed, result = mutation(post)
+            if changed:
+                _atomic_write_text(file_path, frontmatter.dumps(post))
+            return result
+
+    async def mutate_relation_pair(
+        self,
+        left_bucket_id: str,
+        right_bucket_id: str,
+        mutation: Any,
+    ) -> Any:
+        """Atomically change both mirrored Relation ledgers under ordered locks.
+
+        ``mutation(left_post, right_post)`` returns
+        ``(left_changed, right_changed, result)``.  Both bucket files are loaded
+        while holding the same two cross-process bucket turns.  If the second
+        write fails after the first was committed, the first file is restored
+        to its pre-mutation serialization before the error is re-raised.
+        """
+        left_bucket_id = str(left_bucket_id or "").strip()
+        right_bucket_id = str(right_bucket_id or "").strip()
+        if not left_bucket_id or not right_bucket_id or left_bucket_id == right_bucket_id:
+            return None
+
+        first_id, second_id = sorted((left_bucket_id, right_bucket_id))
+        async with self._bucket_turn(first_id):
+            async with self._bucket_turn(second_id):
+                left_path = self._find_bucket_file(left_bucket_id)
+                right_path = self._find_bucket_file(right_bucket_id)
+                if not left_path or not right_path:
+                    return None
+                try:
+                    left_post = frontmatter.load(left_path)
+                    right_post = frontmatter.load(right_path)
+                except Exception:
+                    return None
+
+                left_before = frontmatter.dumps(left_post)
+                right_before = frontmatter.dumps(right_post)
+                left_changed, right_changed, result = mutation(left_post, right_post)
+                if not left_changed and not right_changed:
+                    return result
+
+                left_written = False
+                right_written = False
+                try:
+                    if left_changed:
+                        _atomic_write_text(left_path, frontmatter.dumps(left_post))
+                        left_written = True
+                    if right_changed:
+                        _atomic_write_text(right_path, frontmatter.dumps(right_post))
+                        right_written = True
+                except Exception:
+                    if left_written:
+                        _atomic_write_text(left_path, left_before)
+                    if right_written:
+                        _atomic_write_text(right_path, right_before)
+                    raise
+                return result
 
     async def _update_locked(
         self,
@@ -2421,12 +2527,11 @@ class BucketManager:
         if "title" in kwargs and kwargs["title"]:
             post["title"] = kwargs["title"]
         if "source_refs_append" in kwargs and kwargs["source_refs_append"]:
-            from ombrebrain.storage.source_store import normalize_source_refs
+            from ombrebrain.storage.source_store import append_source_links, active_source_refs_from_links
 
-            existing_refs = post.get("source_refs") or []
-            post["source_refs"] = normalize_source_refs(
-                list(existing_refs) + list(kwargs["source_refs_append"])
-            )
+            links = append_source_links(post.metadata, kwargs["source_refs_append"])
+            post["source_links"] = links
+            post["source_refs"] = active_source_refs_from_links(links)
         if "resolved" in kwargs:
             post["resolved"] = kwargs["resolved"]
         if "pinned" in kwargs:
@@ -2477,6 +2582,7 @@ class BucketManager:
         # iter 1.7 §G3 在这里加入了 "change_log"——plan 桶的状态/编辑历史 list[dict]，
         # 由 server.py 的 plan() / trace() / /api/plans/{id}/action 维护，bucket_manager 不参与生成。
         for k in ("status", "type", "resolution_reason", "resolved_by",
+                  "resolution_suggested",
                   "related_bucket", "author", "user_name", "letter_date",
                   "lock_type", "unlock_date", "locked_by", "lock_owner_source", "writer_name",
                   "change_log",
@@ -3458,15 +3564,29 @@ class BucketManager:
                 if literal_hit:
                     normalized = min(100.0, normalized + _LITERAL_MATCH_BONUS)
 
-                # Threshold check uses raw (pre-penalty) score so resolved buckets
-                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
-                # remain reachable by keyword (penalty applied only to ranking).
-                text_match = normalized >= self.fuzzy_threshold or literal_hit
+                # Relevance is the admission gate. Recency, importance and touch
+                # can improve ranking, but cannot independently admit a bucket.
+                bm25_score = bm25_scores.get(bucket["id"], 0.0)
+                topic_evidence = (
+                    topic_score >= self.topic_relevance_min
+                    or bm25_score > 0.0
+                )
+                text_match = literal_hit or (
+                    normalized >= self.fuzzy_threshold
+                    and topic_evidence
+                )
                 semantic_match = (
                     semantic_score is not None
                     and semantic_score >= _VECTOR_RECALL_THRESHOLD
                 )
                 if text_match or semantic_match:
+                    # Pinning ranks already-relevant memories; it is not
+                    # relevance evidence and cannot bypass admission.
+                    if meta.get("pinned") or meta.get("type") == "permanent":
+                        normalized = min(
+                            100.0,
+                            normalized + self.pinned_relevance_bonus,
+                        )
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
                     if meta.get("resolved", False):

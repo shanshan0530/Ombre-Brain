@@ -41,6 +41,12 @@ from .surface import surface_default
 from .search import surface_search
 
 
+async def _with_deletion_requests(body: str) -> str:
+    store = getattr(rt, "deletion_requests", None)
+    batch = await store.render_pending_batch() if store is not None else ""
+    return f"{batch}\n\n{body}" if batch and body else (batch or body)
+
+
 async def dispatch(
     query: Optional[str] = "",
     max_tokens: Optional[int] = 0,
@@ -105,7 +111,7 @@ async def dispatch(
     if max_tokens <= 0:
         max_tokens = default_tokens
     max_results = min(max_results, 50)
-    max_tokens = min(max_tokens, 20000)
+    max_tokens = min(max_tokens, 40000)
     tag_filter = [t.strip() for t in tags.split(",") if t.strip()]
     memory_max_tokens = max_tokens
 
@@ -114,11 +120,11 @@ async def dispatch(
     # 再 breath(query=...) 精准拉取正文。
     if catalog:
         domain_filter = [d.strip() for d in domain.split(",") if d.strip()]
-        return await surface_catalog(
+        return await _with_deletion_requests(await surface_catalog(
             domain_filter=domain_filter or None,
             tag_filter=tag_filter,
             max_results=max_results,
-        )
+        ))
 
     # --- 解析 tags 过滤；feel/__feel__ 映射到 feel 通道 ---
     if any(t in ("feel", "__feel__") for t in tag_filter):
@@ -127,26 +133,26 @@ async def dispatch(
 
     # --- Feel 通道优先：即使无 query 也直接拉 feel ---
     if domain.strip().lower() == "feel":
-        return await surface_feels(max_tokens=memory_max_tokens)
+        return await _with_deletion_requests(await surface_feels(max_tokens=memory_max_tokens))
 
     # --- importance_min 模式：跳过语义，按 importance 降序 ---
     if importance_min >= 1:
-        return await surface_by_importance(
+        return await _with_deletion_requests(await surface_by_importance(
             importance_min=importance_min,
             max_tokens=memory_max_tokens,
             tag_filter=tag_filter,
-        )
+        ))
 
     # --- 无 query：浮现模式 ---
     if not query or not query.strip():
-        return await surface_default(
+        return await _with_deletion_requests(await surface_default(
             max_results=max_results,
             max_tokens=memory_max_tokens,
             tag_filter=tag_filter,
-        )
+        ))
 
     # --- 有 query：检索模式 ---
-    return await surface_search(
+    return await _with_deletion_requests(await surface_search(
         query=query,
         max_results=max_results,
         max_tokens=memory_max_tokens,
@@ -156,4 +162,4 @@ async def dispatch(
         tag_filter=tag_filter,
         date_from=date_from,
         date_to=date_to,
-    )
+    ))

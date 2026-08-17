@@ -36,6 +36,7 @@ from .._common import (
     check_query_size,
 )
 from utils import strip_wikilinks, get_ai_name, get_owner_name
+from errors import safe_error_detail
 
 
 LETTER_LOCK_TYPES = {"none", "timed", "permanent"}
@@ -293,7 +294,7 @@ async def plan_create(
         event_actor="llm",
     )
     from .._common import append_plan_change_log
-    initial_log = append_plan_change_log([], "created", to=status)
+    initial_log = append_plan_change_log([], "created", to=status, by="plan")
     update_kwargs = {"status": status, "change_log": initial_log}
     if related_bucket.strip():
         update_kwargs["related_bucket"] = related_bucket.strip()
@@ -516,7 +517,7 @@ async def letter_read(
     try:
         all_b = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
-        return f"读取信件失败: {e}"
+        return f"读取信件失败: {safe_error_detail(e)}"
     normalized_letters = []
     states = {}
     for bucket in (b for b in all_b if is_letter_bucket(b)):

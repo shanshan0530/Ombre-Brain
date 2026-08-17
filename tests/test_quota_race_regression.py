@@ -73,6 +73,24 @@ async def test_concurrent_hold_pinned_does_not_exceed_cap(bucket_mgr, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_store_pinned_explicit_domain_overrides_analysis(bucket_mgr):
+    install_runtime(bucket_mgr)
+
+    result = await store_pinned(
+        content="显式 pinned domain",
+        extra_tags=[],
+        valence=0.5,
+        arousal=0.3,
+        why_remembered="",
+        explicit_domain=["人工域"],
+    )
+
+    bucket_id = result.split("→", 1)[1].split()[0]
+    bucket = await bucket_mgr.get(bucket_id)
+    assert bucket["metadata"]["domain"] == ["人工域"]
+
+
+@pytest.mark.asyncio
 async def test_concurrent_trace_protect_does_not_exceed_independent_cap(bucket_mgr):
     install_runtime(bucket_mgr, limits={"max_protected": 3})
 

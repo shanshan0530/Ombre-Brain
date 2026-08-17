@@ -15,12 +15,13 @@ tools/grow/core.py — grow 长内容主路径（digest + merge）
   source_tool 一律为 ``grow``；合并到的老桶不改 source_tool
 - 单条失败不影响其他；按字节上限校验单条尺寸
 - embedding 失败时桶正常创建，返回追加向量化降级警告
-- 末尾 fire-and-forget 触发 plan 自动闭环（用整段原文做匹配）
+- 末尾 fire-and-forget 触发 plan 完成建议（用整段原文做匹配）
 
 不做什么（边界）：
 - 不写 feel：grow 是事件归档，不是反思
 - 不做 pinned 标记：grow 拆出来的事件桶都是 dynamic
-- items 可透传人工 why_remembered；digest 自动理由只在后续合并时补空值
+- items 可透传人工 why_remembered；digest 自动理由在首次新建时写入，
+  后续合并时仅补空值、不覆盖旧理由
 
 对外暴露：grow_core(content) → str
 ========================================
@@ -32,9 +33,9 @@ import uuid
 from utils import normalize_memory_title
 
 try:
-    from errors import PublicToolError
+    from errors import llm_step_failed_error, safe_error_detail
 except ImportError:  # pragma: no cover - 包内导入兜底
-    from ...errors import PublicToolError  # type: ignore
+    from ...errors import llm_step_failed_error, safe_error_detail  # type: ignore
 
 from .. import _runtime as rt
 from .._common import (
@@ -54,9 +55,9 @@ async def grow_core(content: str, test_data: bool = False) -> str:
             "Diary digest failed / 日记整理失败: err_type=%s detail=hidden",
             type(e).__name__,
         )
-        raise PublicToolError(
-            "API key 未配置或调用失败，日记拆分无法完成，桶未创建。"
-            "请检查 OMBRE_COMPRESS_API_KEY。"
+        raise llm_step_failed_error(
+            "日记拆分",
+            api_available=getattr(rt.dehydrator, "api_available", True),
         ) from e
 
     if not isinstance(items, list) or not items:
@@ -77,6 +78,7 @@ async def grow_core(content: str, test_data: bool = False) -> str:
         if size_err:
             return {"line": f"⚠️{item.get('name', '?')}（{size_err}）"}
         try:
+            why_remembered = item.get("why_remembered") or ""
             result_name, is_merged, embed_warn = await merge_or_create(
                 content=item["content"],
                 tags=item.get("tags") or [],
@@ -86,7 +88,8 @@ async def grow_core(content: str, test_data: bool = False) -> str:
                 arousal=item.get("arousal") or 0.3,
                 name=item.get("name", ""),
                 title=normalize_memory_title(item.get("name", "")),
-                merge_why_remembered=item.get("why_remembered") or "",
+                why_remembered=why_remembered,
+                merge_why_remembered=why_remembered,
                 source_tool="grow",
                 grow_batch_id=batch_id,
                 test_data=test_data,
@@ -182,7 +185,7 @@ async def grow_items(items: list, source_content: str = "", test_data: bool = Fa
                 item["_source_ranges"] = ranges
             source_ref = rt.source_store.put(source_content)
         except (OSError, ValueError) as exc:
-            return f"原文证据保存失败，未创建任何桶：{exc}"
+            return f"原文证据保存失败，未创建任何桶：{safe_error_detail(exc)}"
 
     batch_id = f"g_{uuid.uuid4().hex[:12]}"
 

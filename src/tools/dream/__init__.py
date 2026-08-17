@@ -7,11 +7,12 @@ dream 是「我做一次梦——读最近 N 小时内有变动的所有桶，�
 一遍」。这里把整个流程拆成三步：
 1. candidates.py：筛选窗口内的桶 + 软上限
 2. hints.py：连接提示 + 结晶提示 + 待沉淀 I 候选与它们撞上的材料
-3. output.py：拼最终文本（近期活跃/核心准则/active plan/feel 历史/
+3. output.py：拼最终文本（近期活跃/active plan/feel 历史/
    连接提示/结晶提示/I 候选段）
 
-dispatch() 把这几步串起来，并在候选段真的渲染出来之后，给这些候选各记
-一次「被这场梦见证过」——见证是升级进 I 的唯一门槛，所以只认真的被看见的。
+dispatch() 把这几步串起来，并给最终输出中实际出现的候选各记一次
+「被这场梦见证过」——无论它出现在近期正文、候选主块还是碰撞材料；
+见证是升级进 I 的唯一门槛，所以只认真的被看见的。
 
 对外暴露：dispatch(window_hours) → str
 ========================================
@@ -21,7 +22,7 @@ from typing import Optional
 
 from ..i import record_dream_pass
 from .. import _runtime as rt
-from .candidates import collect_candidates, collect_core_context
+from .candidates import collect_candidates
 from .hints import build_connection_hint, build_crystal_hint, collect_self_candidates
 from .output import format_dream_output
 
@@ -39,14 +40,13 @@ async def dispatch(
 
     window_hours = max(1, min(int(window_hours or 48), 24 * 14))
     recent = collect_candidates(all_buckets, window_hours)
-    core_context = collect_core_context(all_buckets)
     try:
         self_review = await collect_self_candidates(all_buckets, window_hours)
     except Exception as exc:
         rt.logger.warning(f"Dream self candidate collection failed: {exc}")
         self_review = None
     has_self_candidates = bool(getattr(self_review, "candidates", None))
-    if not recent and not core_context and not has_self_candidates:
+    if not recent and not has_self_candidates:
         return f"过去 {window_hours} 小时内没有需要消化的新记忆。"
 
     connection_hint = await build_connection_hint(recent)
@@ -58,7 +58,6 @@ async def dispatch(
         window_hours=window_hours,
         connection_hint=connection_hint,
         crystal_hint=crystal_hint,
-        core_context=core_context,
         self_review=self_review,
     )
 
