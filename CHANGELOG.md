@@ -9,6 +9,12 @@
 
 ## 2.17.11
 
+### 修复 / Fixed
+
+- Focus explicit recall questions on their actual topic.
+- Require topic relevance before recency/importance can admit memories.
+- Apply pinned/permanent bonus only after relevance admission.
+
 ### 改进 / Changed
 
 - Relation MCP 可发现性补强：`relation_attach.relation_type` 直接以 schema enum 暴露六种固定类型与 `custom`，四个 Relation 工具的公开说明补齐 ID-first、方向语义、双向镜像、稳定 slot、detached/title 展开和 legacy 行为，避免调用方靠猜测参数。
